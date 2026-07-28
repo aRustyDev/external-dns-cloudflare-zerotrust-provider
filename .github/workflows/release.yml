@@ -1,7 +1,6 @@
-# Container build/push + release. Borrows the shape of the Plane fork's pipeline
-# (docker/build-push-action + gha cache + softprops/action-gh-release with auto notes),
-# modernized for a single Go image: ghcr + GITHUB_TOKEN, metadata-action semver tagging,
-# QEMU multi-arch, and cosign + provenance/SBOM (which Plane's pipeline lacks).
+# Container build/push + release. Multi-arch image to GHCR with metadata-action semver
+# tagging, cosign keyless signing, SLSA provenance + SBOM attestations, a Trivy image-scan
+# gate before signing, and a source SBOM attached to the GitHub release on v* tags.
 name: release
 
 on:
@@ -21,19 +20,26 @@ env:
 jobs:
   image:
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.imagename.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ghcr image refs must be lowercase; the owner (aRustyDev) is mixed-case.
       - name: Compute image name
-        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+        id: imagename
+        run: |
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -41,7 +47,7 @@ jobs:
 
       - name: Docker metadata (tags/labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -53,7 +59,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -65,9 +71,24 @@ jobs:
           provenance: true
           sbom: true
 
+      # Publish gate: scan the pushed image for fixable HIGH/CRITICAL OS-package vulns
+      # before we sign it. Go dependency vulns are gated separately by govulncheck in ci.yaml
+      # (reachability-aware), so this focuses on the base image and avoids double-jeopardy on
+      # unreachable library CVEs. Runs only when an image was actually pushed.
+      - name: Scan image (Trivy)
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os
+          severity: HIGH,CRITICAL
+
       - name: Install cosign
         if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4
 
       - name: Sign image (keyless)
         if: github.event_name != 'pull_request'
@@ -82,6 +103,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/checkout@v7
+
+      # Attach a source (Go module) SBOM to the release as a downloadable asset, in
+      # addition to the SBOM attestation buildx already attaches to the image.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          files: sbom.spdx.json

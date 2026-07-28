@@ -134,18 +134,40 @@ go test -tags=integration -v -run TestLive ./test/integration/
 
 ## Releases & image
 
-CI (`.github/workflows/`) runs `go build/vet/test` on every PR and builds/pushes a **multi-arch**
-(`linux/amd64,arm64`) image to **GHCR** on pushes to `main` (`:latest`, `:sha-…`) and on `vX.Y.Z`
-tags (`:X.Y.Z`, `:X.Y`). Images are **cosign-signed (keyless)** with **SLSA provenance + SBOM**
-attestations. Cut a release by pushing a semver tag:
+CI (`.github/workflows/`) gates every PR with `go build/vet/test -race`, **golangci-lint**, a
+**gofmt** check, **govulncheck** (reachability-aware Go CVEs), **CodeQL** (Go SAST), and
+**dependency review**; `govulncheck` and CodeQL also run weekly. Images build/push **multi-arch**
+(`linux/amd64,arm64`) to **GHCR** on pushes to `main` (`:latest`, `:sha-…`) and on `vX.Y.Z`
+tags (`:X.Y.Z`, `:X.Y`). Before signing, the pushed image is **Trivy-scanned** (fixable
+HIGH/CRITICAL OS vulns gate the release). Images are **cosign-signed (keyless)** with **SLSA
+provenance + SBOM** attestations, and a source SBOM (`sbom.spdx.json`) is attached to each GitHub
+release. Cut a release by pushing a semver tag:
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0   # builds+signs the image and drafts a GitHub release
+git tag v0.2.0 && git push origin v0.2.0   # builds, scans, signs, and drafts a GitHub release
 ```
 
 `deploy/deployment.yaml` pins a released tag (not `:latest`). Bump the pin when you cut a new
 release. If you want **unauthenticated** image pulls, make the GHCR package public once
 (Package → Package settings → Change visibility → Public), or supply an `imagePullSecret`.
+
+### Verifying the image
+
+The image is signed keyless via GitHub Actions OIDC; verify the signature and inspect the
+attached provenance/SBOM attestations:
+
+```sh
+IMG=ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.2.0
+
+# Signature (identity = this repo's release workflow):
+cosign verify "$IMG" \
+  --certificate-identity-regexp '^https://github.com/aRustyDev/external-dns-cloudflare-zerotrust-provider/\.github/workflows/release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# SLSA provenance / SBOM attestations attached by buildx:
+docker buildx imagetools inspect "$IMG" --format '{{ json .Provenance }}'
+docker buildx imagetools inspect "$IMG" --format '{{ json .SBOM }}'
+```
 
 ## License
 
