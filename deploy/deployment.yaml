@@ -63,6 +63,11 @@ spec:
     metadata:
       labels:
         app: external-dns
+      annotations:
+        # The webhook provider exposes Prometheus metrics on the health port at /metrics.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: external-dns
       securityContext:
@@ -96,10 +101,25 @@ spec:
 
         # --- Cloudflare Zero Trust webhook provider (this project) ---
         - name: webhook
-          image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.1.0
+          # Pin to a released tag. This manifest targets v0.2.0 (ownership-strict, metrics,
+          # multi-tunnel); the image exists once the v0.2.0 git tag is cut.
+          image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.2.0
           env:
             - name: DOMAIN_FILTER
               value: "woven"
+            # OWNER_ID tags every route this instance creates
+            # (comment "managed-by=external-dns/<OWNER_ID>").
+            - name: OWNER_ID
+              value: "woven-o11y"
+            # Ownership-strict: only ever read back / delete routes carrying this OWNER_ID,
+            # so Terraform-owned or hand-created routes are never disturbed. Strongly
+            # recommended; set "false" only to deliberately adopt pre-existing routes.
+            - name: OWNERSHIP_STRICT
+              value: "true"
+            # Single tunnel via CF_TUNNEL_ID (from the secret below). For multiple tunnels,
+            # drop CF_TUNNEL_ID and set TUNNEL_MAP instead (most-specific domain wins):
+            #   - name: TUNNEL_MAP
+            #     value: "apps.woven=<tunnel-a>,woven=<tunnel-b>"
             - name: WEBHOOK_LISTEN
               value: "127.0.0.1:8888"
             - name: HEALTH_LISTEN

@@ -10,9 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"sigs.k8s.io/external-dns/provider/webhook/api"
 
 	"github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/cloudflare"
+	"github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/metrics"
 	cfprovider "github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/provider"
 )
 
@@ -21,39 +24,60 @@ func main() {
 
 	accountID := mustEnv(log, "CF_ACCOUNT_ID")
 	apiToken := mustEnv(log, "CF_API_TOKEN")
-	tunnelID := mustEnv(log, "CF_TUNNEL_ID")
+	tunnelID := os.Getenv("CF_TUNNEL_ID")
+	tunnelMap, err := parseTunnelMap(os.Getenv("TUNNEL_MAP"))
+	if err != nil {
+		log.Error("invalid TUNNEL_MAP", "err", err)
+		os.Exit(1)
+	}
+	if tunnelID == "" && len(tunnelMap) == 0 {
+		log.Error("set CF_TUNNEL_ID (single tunnel) or TUNNEL_MAP (domain=tunnel,...)")
+		os.Exit(1)
+	}
+
 	ownerID := envOr("OWNER_ID", "default")
+	ownershipStrict := envBool("OWNERSHIP_STRICT", true)
 	domainFilter := splitCSV(os.Getenv("DOMAIN_FILTER"))
 	webhookListen := envOr("WEBHOOK_LISTEN", "127.0.0.1:8888")
 	healthListen := envOr("HEALTH_LISTEN", "0.0.0.0:8080")
 
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+
 	client := cloudflare.New(accountID, apiToken)
 	p, err := cfprovider.New(cfprovider.Config{
-		Client:       client,
-		TunnelID:     tunnelID,
-		OwnerID:      ownerID,
-		DomainFilter: domainFilter,
+		Client:          client,
+		TunnelID:        tunnelID,
+		TunnelMap:       tunnelMap,
+		OwnerID:         ownerID,
+		OwnershipStrict: ownershipStrict,
+		DomainFilter:    domainFilter,
+		Metrics:         m,
 	})
 	if err != nil {
 		log.Error("configuration error", "err", err)
 		os.Exit(1)
 	}
 
-	go serveHealth(log, healthListen)
+	go serveHealth(log, healthListen, reg)
 
 	log.Info("starting webhook provider",
 		"webhook", webhookListen, "health", healthListen,
-		"tunnel_id", tunnelID, "account_id", accountID, "domain_filter", domainFilter)
+		"tunnel_id", tunnelID, "tunnel_map", tunnelMap, "account_id", accountID,
+		"owner_id", ownerID, "ownership_strict", ownershipStrict, "domain_filter", domainFilter)
 
 	// Blocks. Serves GET /, GET /records, POST /records, POST /adjustendpoints.
 	api.StartHTTPApi(p, nil, 5*time.Second, 10*time.Second, webhookListen)
 }
 
-func serveHealth(log *slog.Logger, addr string) {
+// serveHealth exposes liveness/readiness probes and the Prometheus /metrics endpoint.
+func serveHealth(log *slog.Logger, addr string, reg *prometheus.Registry) {
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }
 	mux.HandleFunc("/healthz", ok)
 	mux.HandleFunc("/readyz", ok)
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Error("health server stopped", "err", err)
@@ -76,6 +100,19 @@ func envOr(key, def string) string {
 	return def
 }
 
+// envBool parses a boolean env var, returning def when unset. Accepts 1/t/true/yes/on
+// (case-insensitive) as true and their negatives as false.
+func envBool(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "":
+		return def
+	case "1", "t", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func splitCSV(s string) []string {
 	if strings.TrimSpace(s) == "" {
 		return nil
@@ -88,4 +125,32 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// parseTunnelMap parses "domain=tunnelID,domain2=tunnelID2" into a map. An empty input
+// yields a nil map (single-tunnel mode). Malformed pairs are an error.
+func parseTunnelMap(s string) (map[string]string, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		domain, tid, found := strings.Cut(pair, "=")
+		domain, tid = strings.TrimSpace(domain), strings.TrimSpace(tid)
+		if !found || domain == "" || tid == "" {
+			return nil, &parseError{pair: pair}
+		}
+		out[domain] = tid
+	}
+	return out, nil
+}
+
+type parseError struct{ pair string }
+
+func (e *parseError) Error() string {
+	return "expected domain=tunnelID, got " + e.pair
 }
