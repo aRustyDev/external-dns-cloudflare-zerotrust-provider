@@ -1,0 +1,29 @@
+name: license
+
+# Enforces the Apache-2.0 header on every Go source file, using the same tool the
+# plane fork uses (google/addlicense) with COPYRIGHT.txt as the header template.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  license-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: addlicense check
+        run: go run github.com/google/addlicense@latest -check -f COPYRIGHT.txt $(git ls-files '*.go')
