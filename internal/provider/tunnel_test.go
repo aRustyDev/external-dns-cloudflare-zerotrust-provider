@@ -21,7 +21,7 @@ import (
 
 func TestResolver_SingleTunnelMatchesEverything(t *testing.T) {
 	r := newSingleTunnelResolver("tun-1")
-	for _, host := range []string{"a.woven", "b.apps.woven", "anything.example.com"} {
+	for _, host := range []string{"a.private", "b.apps.private", "anything.example.com"} {
 		tid, ok := r.resolve(host)
 		if !ok || tid != "tun-1" {
 			t.Fatalf("resolve(%q) = %q,%v; want tun-1,true", host, tid, ok)
@@ -34,17 +34,17 @@ func TestResolver_SingleTunnelMatchesEverything(t *testing.T) {
 
 func TestResolver_LongestSuffixWins(t *testing.T) {
 	r, err := newMapTunnelResolver(map[string]string{
-		"woven":      "t-root",
-		"apps.woven": "t-apps",
+		"private":      "t-root",
+		"apps.private": "t-apps",
 	})
 	if err != nil {
 		t.Fatalf("newMapTunnelResolver: %v", err)
 	}
 	cases := map[string]string{
-		"svc.apps.woven": "t-apps", // most specific
-		"apps.woven":     "t-apps", // exact
-		"other.woven":    "t-root",
-		"woven":          "t-root",
+		"svc.apps.private": "t-apps", // most specific
+		"apps.private":     "t-apps", // exact
+		"other.private":    "t-root",
+		"private":          "t-root",
 	}
 	for host, want := range cases {
 		tid, ok := r.resolve(host)
@@ -55,7 +55,7 @@ func TestResolver_LongestSuffixWins(t *testing.T) {
 }
 
 func TestResolver_NoMatchReturnsFalse(t *testing.T) {
-	r, err := newMapTunnelResolver(map[string]string{"woven": "t-root"})
+	r, err := newMapTunnelResolver(map[string]string{"private": "t-root"})
 	if err != nil {
 		t.Fatalf("newMapTunnelResolver: %v", err)
 	}
@@ -66,9 +66,9 @@ func TestResolver_NoMatchReturnsFalse(t *testing.T) {
 
 func TestResolver_TunnelsDedup(t *testing.T) {
 	r, err := newMapTunnelResolver(map[string]string{
-		"a.woven": "shared",
-		"b.woven": "shared",
-		"c.woven": "other",
+		"a.private": "shared",
+		"b.private": "shared",
+		"c.private": "other",
 	})
 	if err != nil {
 		t.Fatalf("newMapTunnelResolver: %v", err)
@@ -84,7 +84,7 @@ func TestResolver_MapValidation(t *testing.T) {
 	if _, err := newMapTunnelResolver(map[string]string{}); err == nil {
 		t.Error("empty map should error")
 	}
-	if _, err := newMapTunnelResolver(map[string]string{"woven": ""}); err == nil {
+	if _, err := newMapTunnelResolver(map[string]string{"private": ""}); err == nil {
 		t.Error("empty tunnel id should error")
 	}
 	if _, err := newMapTunnelResolver(map[string]string{"": "t"}); err == nil {

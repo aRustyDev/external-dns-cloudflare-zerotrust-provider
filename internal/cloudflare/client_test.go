@@ -37,12 +37,12 @@ func TestCreateHostnameRoute(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &gotBody)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"success":true,"errors":[],"result":{"id":"route-1","hostname":"foo.woven","tunnel_id":"tun-1"}}`))
+		_, _ = w.Write([]byte(`{"success":true,"errors":[],"result":{"id":"route-1","hostname":"foo.private","tunnel_id":"tun-1"}}`))
 	}))
 	defer srv.Close()
 
 	c := New(acct, "tok-xyz", WithBaseURL(srv.URL))
-	route, err := c.CreateHostnameRoute(context.Background(), "foo.woven", "tun-1", "managed-by=external-dns")
+	route, err := c.CreateHostnameRoute(context.Background(), "foo.private", "tun-1", "managed-by=external-dns")
 	if err != nil {
 		t.Fatalf("CreateHostnameRoute: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestCreateHostnameRoute(t *testing.T) {
 	if gotAuth != "Bearer tok-xyz" {
 		t.Errorf("auth = %q, want bearer token", gotAuth)
 	}
-	if gotBody.Hostname != "foo.woven" || gotBody.TunnelID != "tun-1" {
+	if gotBody.Hostname != "foo.private" || gotBody.TunnelID != "tun-1" {
 		t.Errorf("body = %+v", gotBody)
 	}
 	if route.ID != "route-1" {
@@ -69,9 +69,9 @@ func TestListHostnameRoutes_Paginates(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch page {
 		case "1":
-			_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"1","hostname":"a.woven","tunnel_id":"t"}],"result_info":{"page":1,"per_page":1,"total_count":2}}`))
+			_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"1","hostname":"a.private","tunnel_id":"t"}],"result_info":{"page":1,"per_page":1,"total_count":2}}`))
 		default:
-			_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"2","hostname":"b.woven","tunnel_id":"t"}],"result_info":{"page":2,"per_page":1,"total_count":2}}`))
+			_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"2","hostname":"b.private","tunnel_id":"t"}],"result_info":{"page":2,"per_page":1,"total_count":2}}`))
 		}
 	}))
 	defer srv.Close()
@@ -114,7 +114,7 @@ func TestAPIError(t *testing.T) {
 	defer srv.Close()
 
 	c := New(acct, "bad", WithBaseURL(srv.URL))
-	_, err := c.CreateHostnameRoute(context.Background(), "x.woven", "t", "")
+	_, err := c.CreateHostnameRoute(context.Background(), "x.private", "t", "")
 	if err == nil || !strings.Contains(err.Error(), "Authentication error") {
 		t.Fatalf("want auth error surfaced, got %v", err)
 	}

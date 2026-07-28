@@ -21,14 +21,14 @@
 // Zero Trust hostname-route CRUD on the tunnel selected for each hostname (a single tunnel,
 // or the most-specific match from a domain->tunnel map).
 //
-// This provider owns ONLY the Cloudflare route half of a private `.woven` name. The in-cluster
+// This provider owns ONLY the Cloudflare route half of a `.private` name. The in-cluster
 // CoreDNS answer (name -> Service ClusterIP) is a separate concern (a CoreDNS fragment / etcd
 // source) and is intentionally out of scope here.
 //
 // Ownership: routes are tagged with a "managed-by=external-dns/<owner>" comment. In
 // ownership-strict mode the provider only ever reads back and deletes routes carrying its own
 // owner tag, so it cannot disturb routes created by Terraform or by hand — important where an
-// external system (e.g. OpenTofu) is the declared sole owner of some `.woven` routes.
+// external system (e.g. Terraform) is the declared sole owner of some `.private` routes.
 package provider
 
 import (

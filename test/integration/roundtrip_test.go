@@ -22,7 +22,7 @@
 //	export CF_API_TOKEN=...        # scoped token, deletable
 //	export CF_ACCOUNT_ID=...
 //	export CF_TUNNEL_ID=...        # a throwaway tunnel
-//	# optional: export INTEGRATION_HOSTNAME=extdns-cfzt-it.woven
+//	# optional: export INTEGRATION_HOSTNAME=extdns-cfzt-it.private
 //	go test -tags=integration -v -run TestLive ./test/integration/
 //
 // Each test creates a uniquely-named route, asserts the round-trip, and cleans up after
@@ -55,7 +55,7 @@ func testHost(t *testing.T) string {
 	if h := os.Getenv("INTEGRATION_HOSTNAME"); h != "" {
 		return h
 	}
-	return fmt.Sprintf("extdns-cfzt-it-%d.woven", time.Now().UnixNano())
+	return fmt.Sprintf("extdns-cfzt-it-%d.private", time.Now().UnixNano())
 }
 
 // activeHost reports whether an un-deleted route for host exists in routes.
@@ -124,7 +124,7 @@ func TestLiveProviderApplyChanges(t *testing.T) {
 		TunnelID:        tunnel,
 		OwnerID:         "integration-test",
 		OwnershipStrict: true,
-		DomainFilter:    []string{"woven"},
+		DomainFilter:    []string{"private"},
 	})
 	if err != nil {
 		t.Fatalf("New provider: %v", err)

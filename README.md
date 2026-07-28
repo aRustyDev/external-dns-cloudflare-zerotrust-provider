@@ -13,7 +13,7 @@ resolve-through-tunnel path — and removes it when the Service goes away.
 
 ## Scope — read this first
 
-A private `<name>.woven` name needs **two** independent things to resolve over WARP:
+A `<name>.private` name needs **two** independent things to resolve over WARP:
 
 1. **A Cloudflare Zero Trust hostname route** binding the name to the tunnel — **this provider
    manages this half** (via the `zerotrust/routes/hostname` API).
@@ -29,7 +29,7 @@ tunnel routes — which is why this webhook exists.
 ```
 Service annotation                ExternalDNS core            this webhook (sidecar)
 external-dns.alpha.kubernetes.io  --provider=webhook   -->    POST/DELETE
-  /hostname: foo.woven            (localhost:8888)            /accounts/{id}/zerotrust/routes/hostname
+  /hostname: foo.private            (localhost:8888)            /accounts/{id}/zerotrust/routes/hostname
 ```
 
 A Cloudflare Tunnel has the canonical target `<tunnel-id>.cfargotunnel.com`. The provider models
@@ -62,7 +62,7 @@ kubectl apply -f deploy/deployment.yaml
 | `TUNNEL_MAP` | conditional | — | Multi-tunnel mode: `domain=tunnelID,...` (most-specific domain wins). Supersedes `CF_TUNNEL_ID` |
 | `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`) |
 | `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
-| `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `woven`) |
+| `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `private`) |
 | `WEBHOOK_LISTEN` | no | `127.0.0.1:8888` | Webhook API listen address (localhost-only by design) |
 | `HEALTH_LISTEN` | no | `0.0.0.0:8080` | Health (`/healthz`, `/readyz`) **and** Prometheus `/metrics` |
 
@@ -89,11 +89,11 @@ deliberately adopt/manage pre-existing routes regardless of their comment.
 Run one instance per tunnel, **or** set `TUNNEL_MAP` to serve several tunnels from one instance:
 
 ```
-TUNNEL_MAP=apps.woven=<tunnel-a>,woven=<tunnel-b>
+TUNNEL_MAP=apps.private=<tunnel-a>,private=<tunnel-b>
 ```
 
 Each hostname is bound to the tunnel of its **longest matching domain suffix**, so
-`svc.apps.woven` → `tunnel-a` and `other.woven` → `tunnel-b`. A hostname matching no configured
+`svc.apps.private` → `tunnel-a` and `other.private` → `tunnel-b`. A hostname matching no configured
 domain is skipped.
 
 ## Metrics

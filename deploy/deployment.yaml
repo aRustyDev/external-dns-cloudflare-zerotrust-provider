@@ -87,7 +87,7 @@ spec:
             # once you have validated the round-trip (ideally paired with ownership-strict
             # mode so deletes are confined to routes this instance owns).
             - --policy=upsert-only
-            - --domain-filter=woven
+            - --domain-filter=private
             - --interval=1m
             - --log-level=info
           ports:
@@ -106,11 +106,11 @@ spec:
           image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.2.0
           env:
             - name: DOMAIN_FILTER
-              value: "woven"
+              value: "private"
             # OWNER_ID tags every route this instance creates
             # (comment "managed-by=external-dns/<OWNER_ID>").
             - name: OWNER_ID
-              value: "woven-o11y"
+              value: "cluster-a"
             # Ownership-strict: only ever read back / delete routes carrying this OWNER_ID,
             # so Terraform-owned or hand-created routes are never disturbed. Strongly
             # recommended; set "false" only to deliberately adopt pre-existing routes.
@@ -119,7 +119,7 @@ spec:
             # Single tunnel via CF_TUNNEL_ID (from the secret below). For multiple tunnels,
             # drop CF_TUNNEL_ID and set TUNNEL_MAP instead (most-specific domain wins):
             #   - name: TUNNEL_MAP
-            #     value: "apps.woven=<tunnel-a>,woven=<tunnel-b>"
+            #     value: "apps.private=<tunnel-a>,private=<tunnel-b>"
             - name: WEBHOOK_LISTEN
               value: "127.0.0.1:8888"
             - name: HEALTH_LISTEN
