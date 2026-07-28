@@ -4,27 +4,38 @@
 // Mapping model: a Cloudflare Tunnel has the canonical target "<tunnel-id>.cfargotunnel.com".
 // We represent every managed hostname as a CNAME Endpoint pointing at that target, so
 // ExternalDNS's plan produces stable diffs. ApplyChanges then translates Create/Delete into
-// Zero Trust hostname-route CRUD on the configured tunnel.
+// Zero Trust hostname-route CRUD on the tunnel selected for each hostname (a single tunnel,
+// or the most-specific match from a domain->tunnel map).
 //
 // This provider owns ONLY the Cloudflare route half of a private `.woven` name. The in-cluster
 // CoreDNS answer (name -> Service ClusterIP) is a separate concern (a CoreDNS fragment / etcd
 // source) and is intentionally out of scope here.
+//
+// Ownership: routes are tagged with a "managed-by=external-dns/<owner>" comment. In
+// ownership-strict mode the provider only ever reads back and deletes routes carrying its own
+// owner tag, so it cannot disturb routes created by Terraform or by hand — important where an
+// external system (e.g. OpenTofu) is the declared sole owner of some `.woven` routes.
 package provider
 
 import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
 	extprovider "sigs.k8s.io/external-dns/provider"
 
 	"github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/cloudflare"
+	"github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/metrics"
 )
 
 // recordType is the type we synthesize for every managed hostname route.
 const recordType = endpoint.RecordTypeCNAME
+
+// managedByPrefix is the comment prefix stamped on every route this project creates.
+const managedByPrefix = "managed-by=external-dns"
 
 // routeAPI is the subset of the Cloudflare client the provider needs (interface for testability).
 type routeAPI interface {
@@ -37,19 +48,30 @@ type routeAPI interface {
 type Provider struct {
 	*extprovider.BaseProvider
 
-	client       routeAPI
-	tunnelID     string
-	tunnelTarget string // "<tunnel-id>.cfargotunnel.com"
-	ownerID      string
-	domainFilter *endpoint.DomainFilter
+	client          routeAPI
+	resolver        *tunnelResolver
+	ownerID         string
+	ownershipStrict bool
+	domainFilter    *endpoint.DomainFilter
+	metrics         *metrics.Metrics
 }
 
 // Config configures a Provider.
 type Config struct {
-	Client       routeAPI
-	TunnelID     string
-	OwnerID      string
-	DomainFilter []string
+	Client routeAPI
+	// TunnelID selects single-tunnel mode: every managed hostname is bound to this tunnel.
+	TunnelID string
+	// TunnelMap selects multi-tunnel mode (domain -> tunnel id). When non-empty it takes
+	// precedence over TunnelID and a hostname is bound to the tunnel of its longest matching
+	// domain suffix.
+	TunnelMap map[string]string
+	// OwnerID tags managed routes and, in strict mode, scopes which routes are managed.
+	OwnerID string
+	// OwnershipStrict, when true, restricts Records()/deletes to routes this owner created.
+	OwnershipStrict bool
+	DomainFilter    []string
+	// Metrics is optional; nil disables metrics (all metric calls are no-ops).
+	Metrics *metrics.Metrics
 }
 
 // New builds a Provider.
@@ -57,56 +79,99 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("cloudflare client is required")
 	}
-	if cfg.TunnelID == "" {
-		return nil, fmt.Errorf("tunnel id is required")
+	var resolver *tunnelResolver
+	switch {
+	case len(cfg.TunnelMap) > 0:
+		r, err := newMapTunnelResolver(cfg.TunnelMap)
+		if err != nil {
+			return nil, err
+		}
+		resolver = r
+	case cfg.TunnelID != "":
+		resolver = newSingleTunnelResolver(cfg.TunnelID)
+	default:
+		return nil, fmt.Errorf("a tunnel id or a non-empty tunnel map is required")
 	}
-	df := endpoint.NewDomainFilter(cfg.DomainFilter)
 	return &Provider{
-		BaseProvider: &extprovider.BaseProvider{},
-		client:       cfg.Client,
-		tunnelID:     cfg.TunnelID,
-		tunnelTarget: cfg.TunnelID + ".cfargotunnel.com",
-		ownerID:      cfg.OwnerID,
-		domainFilter: df,
+		BaseProvider:    &extprovider.BaseProvider{},
+		client:          cfg.Client,
+		resolver:        resolver,
+		ownerID:         cfg.OwnerID,
+		ownershipStrict: cfg.OwnershipStrict,
+		domainFilter:    endpoint.NewDomainFilter(cfg.DomainFilter),
+		metrics:         cfg.Metrics,
 	}, nil
 }
 
 // comment tags routes we manage so they are distinguishable from hand-created ones.
 func (p *Provider) comment() string {
 	if p.ownerID == "" {
-		return "managed-by=external-dns"
+		return managedByPrefix
 	}
-	return "managed-by=external-dns/" + p.ownerID
+	return managedByPrefix + "/" + p.ownerID
 }
 
-// Records lists the tunnel's hostname routes as CNAME endpoints (filtered by domain filter).
+// routeOwner parses a route comment. managed is true if the comment was written by this
+// project (any owner); owner is the owner id ("" when the comment carries no owner).
+func routeOwner(comment string) (owner string, managed bool) {
+	c := strings.TrimSpace(comment)
+	if c == managedByPrefix {
+		return "", true
+	}
+	if rest, ok := strings.CutPrefix(c, managedByPrefix+"/"); ok {
+		return rest, true
+	}
+	return "", false
+}
+
+// owns reports whether this provider instance owns the route (managed by us, our owner id).
+func (p *Provider) owns(r cloudflare.HostnameRoute) bool {
+	owner, managed := routeOwner(r.Comment)
+	return managed && owner == p.ownerID
+}
+
+// Records lists managed hostname routes across the configured tunnel(s) as CNAME endpoints.
+// It filters by domain filter and, in ownership-strict mode, by owner tag.
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
-	routes, err := p.client.ListHostnameRoutes(ctx, p.tunnelID)
-	if err != nil {
-		return nil, err
-	}
 	var out []*endpoint.Endpoint
-	for _, r := range routes {
-		if r.DeletedAt != nil {
-			continue
+	for _, tid := range p.resolver.tunnels() {
+		routes, err := p.client.ListHostnameRoutes(ctx, tid)
+		p.metrics.APIRequest(metrics.OpList, err)
+		if err != nil {
+			return nil, err
 		}
-		if !p.domainFilter.Match(r.Hostname) {
-			continue
+		target := p.resolver.target(tid)
+		for _, r := range routes {
+			if r.DeletedAt != nil {
+				continue
+			}
+			if !p.domainFilter.Match(r.Hostname) {
+				continue
+			}
+			if p.ownershipStrict && !p.owns(r) {
+				continue
+			}
+			out = append(out, endpoint.NewEndpoint(r.Hostname, recordType, target))
 		}
-		out = append(out, endpoint.NewEndpoint(r.Hostname, recordType, p.tunnelTarget))
 	}
+	p.metrics.SetRecordsManaged(len(out))
 	return out, nil
 }
 
 // AdjustEndpoints canonicalizes candidate endpoints so plan diffs are stable: everything we
-// manage is a CNAME to the tunnel target, regardless of what the source proposed.
+// manage becomes a CNAME to the target of the tunnel selected for its hostname. Hostnames
+// outside the domain filter, or with no matching tunnel, are dropped.
 func (p *Provider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
 	var out []*endpoint.Endpoint
 	for _, ep := range endpoints {
 		if !p.domainFilter.Match(ep.DNSName) {
 			continue
 		}
-		out = append(out, endpoint.NewEndpoint(ep.DNSName, recordType, p.tunnelTarget))
+		target, ok := p.resolver.targetFor(ep.DNSName)
+		if !ok {
+			continue // no tunnel configured for this hostname's domain
+		}
+		out = append(out, endpoint.NewEndpoint(ep.DNSName, recordType, target))
 	}
 	return out, nil
 }
@@ -117,21 +182,31 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 }
 
 // ApplyChanges creates/deletes hostname routes to satisfy the plan. Updates are no-ops: a
-// route is just a hostname->tunnel binding, and this provider serves a single tunnel.
+// route is just a hostname->tunnel binding with no mutable attributes this provider manages.
 func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
 	if changes == nil || (len(changes.Create) == 0 && len(changes.Delete) == 0) {
 		return nil
 	}
+	start := time.Now()
+	defer func() { p.metrics.ObserveApply(time.Since(start).Seconds()) }()
 
-	// Build hostname -> route-id from the live set once, for deletes.
+	// Build hostname -> route-id from the live set once, for deletes. In ownership-strict mode
+	// only our own routes are eligible, so we never delete Terraform-owned / hand-created ones.
 	byHost := map[string]string{}
 	if len(changes.Delete) > 0 {
-		routes, err := p.client.ListHostnameRoutes(ctx, p.tunnelID)
-		if err != nil {
-			return fmt.Errorf("list routes for delete: %w", err)
-		}
-		for _, r := range routes {
-			if r.DeletedAt == nil {
+		for _, tid := range p.resolver.tunnels() {
+			routes, err := p.client.ListHostnameRoutes(ctx, tid)
+			p.metrics.APIRequest(metrics.OpList, err)
+			if err != nil {
+				return fmt.Errorf("list routes for delete: %w", err)
+			}
+			for _, r := range routes {
+				if r.DeletedAt != nil {
+					continue
+				}
+				if p.ownershipStrict && !p.owns(r) {
+					continue
+				}
 				byHost[strings.ToLower(r.Hostname)] = r.ID
 			}
 		}
@@ -141,9 +216,16 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		if !p.domainFilter.Match(ep.DNSName) {
 			continue
 		}
-		if _, err := p.client.CreateHostnameRoute(ctx, ep.DNSName, p.tunnelID, p.comment()); err != nil {
+		tid, ok := p.resolver.resolve(ep.DNSName)
+		if !ok {
+			return fmt.Errorf("no tunnel configured for hostname %q", ep.DNSName)
+		}
+		_, err := p.client.CreateHostnameRoute(ctx, ep.DNSName, tid, p.comment())
+		p.metrics.APIRequest(metrics.OpCreate, err)
+		if err != nil {
 			return fmt.Errorf("create route %q: %w", ep.DNSName, err)
 		}
+		p.metrics.RouteCreated()
 	}
 
 	for _, ep := range changes.Delete {
@@ -152,11 +234,14 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		}
 		id, ok := byHost[strings.ToLower(ep.DNSName)]
 		if !ok {
-			continue // already gone
+			continue // already gone, or not owned by us in strict mode
 		}
-		if err := p.client.DeleteHostnameRoute(ctx, id); err != nil {
+		err := p.client.DeleteHostnameRoute(ctx, id)
+		p.metrics.APIRequest(metrics.OpDelete, err)
+		if err != nil {
 			return fmt.Errorf("delete route %q: %w", ep.DNSName, err)
 		}
+		p.metrics.RouteDeleted()
 	}
 	return nil
 }

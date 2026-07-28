@@ -58,18 +58,56 @@ kubectl apply -f deploy/deployment.yaml
 |---|---|---|---|
 | `CF_API_TOKEN` | yes | — | Scoped Cloudflare API token (preferred over a global key) |
 | `CF_ACCOUNT_ID` | yes | — | Cloudflare account ID |
-| `CF_TUNNEL_ID` | yes | — | Tunnel the hostname routes bind to (one tunnel per instance) |
-| `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `woven`) |
+| `CF_TUNNEL_ID` | conditional | — | Single-tunnel mode: tunnel the hostname routes bind to. Required unless `TUNNEL_MAP` is set |
+| `TUNNEL_MAP` | conditional | — | Multi-tunnel mode: `domain=tunnelID,...` (most-specific domain wins). Supersedes `CF_TUNNEL_ID` |
 | `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`) |
+| `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
+| `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `woven`) |
 | `WEBHOOK_LISTEN` | no | `127.0.0.1:8888` | Webhook API listen address (localhost-only by design) |
-| `HEALTH_LISTEN` | no | `0.0.0.0:8080` | Health endpoints (`/healthz`, `/readyz`) |
+| `HEALTH_LISTEN` | no | `0.0.0.0:8080` | Health (`/healthz`, `/readyz`) **and** Prometheus `/metrics` |
 
 ### ExternalDNS flags that matter
 
 - `--provider=webhook` and (implicitly) `--webhook-provider-url=http://localhost:8888`.
 - `--registry=noop` — **required**: Zero Trust routes can't store TXT ownership records.
 - `--policy=sync` to allow deletes; `--policy=upsert-only` while validating.
-- One tunnel per instance — run additional instances for additional tunnels.
+
+## Ownership
+
+Every route this provider creates is tagged with a comment `managed-by=external-dns/<OWNER_ID>`.
+With **`OWNERSHIP_STRICT=true` (the default)** the provider only ever *sees* (in `Records`) and
+*deletes* routes carrying its own `OWNER_ID`. Routes created by Terraform, by hand, or by a
+different owner are invisible to it and can never be deleted by it — important where an external
+system is the declared sole owner of some routes. Set `OWNERSHIP_STRICT=false` only to
+deliberately adopt/manage pre-existing routes regardless of their comment.
+
+> Strict mode + `--policy=sync` is the safe production combination: deletes are enabled but
+> confined to this instance's own routes.
+
+## Multiple tunnels
+
+Run one instance per tunnel, **or** set `TUNNEL_MAP` to serve several tunnels from one instance:
+
+```
+TUNNEL_MAP=apps.woven=<tunnel-a>,woven=<tunnel-b>
+```
+
+Each hostname is bound to the tunnel of its **longest matching domain suffix**, so
+`svc.apps.woven` → `tunnel-a` and `other.woven` → `tunnel-b`. A hostname matching no configured
+domain is skipped.
+
+## Metrics
+
+Prometheus metrics are exposed on the health port at `/metrics` (the sample manifest sets the
+`prometheus.io/scrape` annotations):
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `cfzt_provider_api_requests_total` | counter | `operation` (`list`/`create`/`delete`), `result` (`success`/`error`) | Cloudflare API calls |
+| `cfzt_provider_routes_created_total` | counter | — | Hostname routes created |
+| `cfzt_provider_routes_deleted_total` | counter | — | Hostname routes deleted |
+| `cfzt_provider_apply_duration_seconds` | histogram | — | `ApplyChanges` reconcile duration |
+| `cfzt_provider_records_managed` | gauge | — | Managed routes seen on the last `Records()` |
 
 ## Development
 
@@ -82,6 +120,18 @@ make docker  # container image
 Built against `sigs.k8s.io/external-dns v0.21.0` (imported as a library; the stock ExternalDNS
 image is the core, this binary is the sidecar).
 
+### Live integration test
+
+`test/integration/` holds a **live** create → list → delete round-trip (raw client *and* full
+provider path) against the real API, gated behind the `integration` build tag so `go test ./...`
+never runs it. Point it at a **throwaway** tunnel with a scoped, deletable token; each test cleans
+up after itself:
+
+```sh
+export CF_API_TOKEN=...   CF_ACCOUNT_ID=...   CF_TUNNEL_ID=...
+go test -tags=integration -v -run TestLive ./test/integration/
+```
+
 ## Releases & image
 
 CI (`.github/workflows/`) runs `go build/vet/test` on every PR and builds/pushes a **multi-arch**
@@ -90,11 +140,12 @@ tags (`:X.Y.Z`, `:X.Y`). Images are **cosign-signed (keyless)** with **SLSA prov
 attestations. Cut a release by pushing a semver tag:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0   # builds+signs the image and drafts a GitHub release
+git tag v0.2.0 && git push origin v0.2.0   # builds+signs the image and drafts a GitHub release
 ```
 
-`deploy/deployment.yaml` pins `:latest` — pin a released tag in production. (On first publish, make
-the GHCR package public if you want unauthenticated pulls.)
+`deploy/deployment.yaml` pins a released tag (not `:latest`). Bump the pin when you cut a new
+release. If you want **unauthenticated** image pulls, make the GHCR package public once
+(Package → Package settings → Change visibility → Public), or supply an `imagePullSecret`.
 
 ## License
 
