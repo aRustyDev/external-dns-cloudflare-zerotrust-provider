@@ -1,0 +1,24 @@
+name: dependency-review
+
+# Flags dependency changes on a PR that introduce known-vulnerable or
+# disallowed-licensed modules, before they merge. Uses the repository's
+# Dependency Graph (enabled by default on public repos).
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # post the review summary comment
+    steps:
+      - uses: actions/checkout@v7
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
