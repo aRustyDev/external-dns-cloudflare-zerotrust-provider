@@ -77,9 +77,11 @@ spec:
             - --webhook-provider-url=http://localhost:8888
             # ZT hostname routes cannot store TXT ownership records -> no-op registry.
             - --registry=noop
-            # sync policy enables route DELETES on Service removal. Use upsert-only to
-            # disable deletes while validating.
-            - --policy=sync
+            # upsert-only never deletes routes: safe default for validating against a live
+            # tunnel. Switch to --policy=sync to enable route DELETES on Service removal
+            # once you have validated the round-trip (ideally paired with ownership-strict
+            # mode so deletes are confined to routes this instance owns).
+            - --policy=upsert-only
             - --domain-filter=woven
             - --interval=1m
             - --log-level=info
@@ -94,7 +96,7 @@ spec:
 
         # --- Cloudflare Zero Trust webhook provider (this project) ---
         - name: webhook
-          image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:latest
+          image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.1.0
           env:
             - name: DOMAIN_FILTER
               value: "woven"
