@@ -82,6 +82,20 @@ make docker  # container image
 Built against `sigs.k8s.io/external-dns v0.21.0` (imported as a library; the stock ExternalDNS
 image is the core, this binary is the sidecar).
 
+## Releases & image
+
+CI (`.github/workflows/`) runs `go build/vet/test` on every PR and builds/pushes a **multi-arch**
+(`linux/amd64,arm64`) image to **GHCR** on pushes to `main` (`:latest`, `:sha-…`) and on `vX.Y.Z`
+tags (`:X.Y.Z`, `:X.Y`). Images are **cosign-signed (keyless)** with **SLSA provenance + SBOM**
+attestations. Cut a release by pushing a semver tag:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0   # builds+signs the image and drafts a GitHub release
+```
+
+`deploy/deployment.yaml` pins `:latest` — pin a released tag in production. (On first publish, make
+the GHCR package public if you want unauthenticated pulls.)
+
 ## License
 
 [Apache-2.0](LICENSE).
