@@ -1,0 +1,123 @@
+# ExternalDNS running the Cloudflare Zero Trust webhook provider as a sidecar.
+#
+# Provide the Cloudflare credentials out-of-band (do NOT commit a real token):
+#   kubectl -n external-dns create secret generic cf-zerotrust \
+#     --from-literal=CF_API_TOKEN=<scoped-token> \
+#     --from-literal=CF_ACCOUNT_ID=<account-id> \
+#     --from-literal=CF_TUNNEL_ID=<tunnel-id>
+#
+# The scoped API token needs: Account > Cloudflare Tunnel : Edit (Zero Trust routes).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-dns
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-dns
+  namespace: external-dns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods", "nodes"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns
+subjects:
+  - kind: ServiceAccount
+    name: external-dns
+    namespace: external-dns
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: external-dns
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: external-dns
+  template:
+    metadata:
+      labels:
+        app: external-dns
+    spec:
+      serviceAccountName: external-dns
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        # --- ExternalDNS core: talks to our webhook over localhost ---
+        - name: external-dns
+          image: registry.k8s.io/external-dns/external-dns:v0.21.0
+          args:
+            - --source=service
+            - --provider=webhook
+            - --webhook-provider-url=http://localhost:8888
+            # ZT hostname routes cannot store TXT ownership records -> no-op registry.
+            - --registry=noop
+            # sync policy enables route DELETES on Service removal. Use upsert-only to
+            # disable deletes while validating.
+            - --policy=sync
+            - --domain-filter=woven
+            - --interval=1m
+            - --log-level=info
+          ports:
+            - name: http
+              containerPort: 7979
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+        # --- Cloudflare Zero Trust webhook provider (this project) ---
+        - name: webhook
+          image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:latest
+          env:
+            - name: DOMAIN_FILTER
+              value: "woven"
+            - name: WEBHOOK_LISTEN
+              value: "127.0.0.1:8888"
+            - name: HEALTH_LISTEN
+              value: "0.0.0.0:8080"
+          envFrom:
+            - secretRef:
+                name: cf-zerotrust
+          ports:
+            - name: health
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

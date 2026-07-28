@@ -1,0 +1,22 @@
+# Any Service annotated with a `.woven` hostname gets a Cloudflare Zero Trust private
+# hostname route created on the configured tunnel. ExternalDNS's service source reads the
+# annotation; this provider creates the route.
+#
+# NOTE: this only manages the Cloudflare route half. The in-cluster CoreDNS answer
+# (foo.woven -> foo.<ns>.svc.cluster.local, so cloudflared can forward to the ClusterIP)
+# is a SEPARATE concern — a CoreDNS fragment / etcd source — and is not managed here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: foo
+  namespace: apps
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: foo.woven
+spec:
+  type: ClusterIP
+  selector:
+    app: foo
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
