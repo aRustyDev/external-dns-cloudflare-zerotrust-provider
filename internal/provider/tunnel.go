@@ -28,7 +28,7 @@ const tunnelTargetSuffix = ".cfargotunnel.com"
 // Single-tunnel mode: fallback is set and entries is empty, so every hostname resolves
 // to the one tunnel. Multi-tunnel mode: entries hold domain->tunnel bindings and a
 // hostname resolves to the entry with the longest matching domain suffix (most specific
-// wins), e.g. "a.apps.woven" prefers "apps.woven" over "woven".
+// wins), e.g. "a.apps.private" prefers "apps.private" over "private".
 type tunnelResolver struct {
 	entries  []tunnelEntry // sorted longest-domain-first
 	fallback string        // single-tunnel id; "" when a map is configured

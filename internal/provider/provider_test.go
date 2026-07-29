@@ -75,10 +75,10 @@ func newTestProvider(t *testing.T, api routeAPI, domains ...string) *Provider {
 
 func TestRecords_FiltersAndMaps(t *testing.T) {
 	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
-		{ID: "1", Hostname: "foo.woven", TunnelID: testTunnel},
+		{ID: "1", Hostname: "foo.private", TunnelID: testTunnel},
 		{ID: "2", Hostname: "bar.example.com", TunnelID: testTunnel}, // out of domain filter
 	}}
-	p := newTestProvider(t, api, "woven")
+	p := newTestProvider(t, api, "private")
 
 	eps, err := p.Records(context.Background())
 	if err != nil {
@@ -87,7 +87,7 @@ func TestRecords_FiltersAndMaps(t *testing.T) {
 	if len(eps) != 1 {
 		t.Fatalf("want 1 endpoint, got %d", len(eps))
 	}
-	if eps[0].DNSName != "foo.woven" || eps[0].RecordType != endpoint.RecordTypeCNAME {
+	if eps[0].DNSName != "foo.private" || eps[0].RecordType != endpoint.RecordTypeCNAME {
 		t.Fatalf("unexpected endpoint: %+v", eps[0])
 	}
 	if got := eps[0].Targets[0]; got != testTunnel+".cfargotunnel.com" {
@@ -96,9 +96,9 @@ func TestRecords_FiltersAndMaps(t *testing.T) {
 }
 
 func TestAdjustEndpoints_Canonicalizes(t *testing.T) {
-	p := newTestProvider(t, &fakeAPI{}, "woven")
+	p := newTestProvider(t, &fakeAPI{}, "private")
 	in := []*endpoint.Endpoint{
-		endpoint.NewEndpoint("foo.woven", endpoint.RecordTypeA, "10.0.0.5"), // wrong type+target
+		endpoint.NewEndpoint("foo.private", endpoint.RecordTypeA, "10.0.0.5"), // wrong type+target
 		endpoint.NewEndpoint("skip.example.com", endpoint.RecordTypeA, "1.2.3.4"),
 	}
 	out, err := p.AdjustEndpoints(in)
@@ -115,29 +115,29 @@ func TestAdjustEndpoints_Canonicalizes(t *testing.T) {
 
 func TestApplyChanges_CreateAndDelete(t *testing.T) {
 	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
-		{ID: "id-old.woven", Hostname: "old.woven", TunnelID: testTunnel},
+		{ID: "id-old.private", Hostname: "old.private", TunnelID: testTunnel},
 	}}
-	p := newTestProvider(t, api, "woven")
+	p := newTestProvider(t, api, "private")
 
 	target := p.resolver.target(testTunnel)
 	changes := &plan.Changes{
-		Create: []*endpoint.Endpoint{endpoint.NewEndpoint("new.woven", endpoint.RecordTypeCNAME, target)},
-		Delete: []*endpoint.Endpoint{endpoint.NewEndpoint("old.woven", endpoint.RecordTypeCNAME, target)},
+		Create: []*endpoint.Endpoint{endpoint.NewEndpoint("new.private", endpoint.RecordTypeCNAME, target)},
+		Delete: []*endpoint.Endpoint{endpoint.NewEndpoint("old.private", endpoint.RecordTypeCNAME, target)},
 	}
 	if err := p.ApplyChanges(context.Background(), changes); err != nil {
 		t.Fatalf("ApplyChanges: %v", err)
 	}
-	if len(api.created) != 1 || api.created[0] != "new.woven" {
-		t.Fatalf("created = %v, want [new.woven]", api.created)
+	if len(api.created) != 1 || api.created[0] != "new.private" {
+		t.Fatalf("created = %v, want [new.private]", api.created)
 	}
-	if len(api.deleted) != 1 || api.deleted[0] != "id-old.woven" {
-		t.Fatalf("deleted = %v, want [id-old.woven]", api.deleted)
+	if len(api.deleted) != 1 || api.deleted[0] != "id-old.private" {
+		t.Fatalf("deleted = %v, want [id-old.private]", api.deleted)
 	}
 }
 
 func TestApplyChanges_NilIsNoop(t *testing.T) {
 	api := &fakeAPI{}
-	p := newTestProvider(t, api, "woven")
+	p := newTestProvider(t, api, "private")
 	if err := p.ApplyChanges(context.Background(), nil); err != nil {
 		t.Fatalf("nil changes should be a no-op, got %v", err)
 	}
@@ -155,23 +155,23 @@ func strictProvider(t *testing.T, api routeAPI, owner string, domains ...string)
 
 func TestOwnershipStrict_RecordsOnlyOwned(t *testing.T) {
 	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
-		{ID: "1", Hostname: "mine.woven", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
-		{ID: "2", Hostname: "theirs.woven", TunnelID: testTunnel, Comment: "managed-by=external-dns/other"},
-		{ID: "3", Hostname: "manual.woven", TunnelID: testTunnel, Comment: "hand-created"},
+		{ID: "1", Hostname: "mine.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+		{ID: "2", Hostname: "theirs.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/other"},
+		{ID: "3", Hostname: "manual.private", TunnelID: testTunnel, Comment: "hand-created"},
 	}}
 
 	// Strict: only our own route surfaces.
-	strict := strictProvider(t, api, "test", "woven")
+	strict := strictProvider(t, api, "test", "private")
 	eps, err := strict.Records(context.Background())
 	if err != nil {
 		t.Fatalf("Records: %v", err)
 	}
-	if len(eps) != 1 || eps[0].DNSName != "mine.woven" {
-		t.Fatalf("strict Records = %v, want [mine.woven]", names(eps))
+	if len(eps) != 1 || eps[0].DNSName != "mine.private" {
+		t.Fatalf("strict Records = %v, want [mine.private]", names(eps))
 	}
 
 	// Non-strict: all domain-matching routes surface, regardless of owner.
-	loose := newTestProvider(t, api, "woven")
+	loose := newTestProvider(t, api, "private")
 	eps, err = loose.Records(context.Background())
 	if err != nil {
 		t.Fatalf("Records: %v", err)
@@ -183,21 +183,21 @@ func TestOwnershipStrict_RecordsOnlyOwned(t *testing.T) {
 
 func TestOwnershipStrict_DeleteSkipsUnowned(t *testing.T) {
 	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
-		{ID: "id-mine.woven", Hostname: "mine.woven", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
-		{ID: "id-manual.woven", Hostname: "manual.woven", TunnelID: testTunnel, Comment: "hand-created"},
+		{ID: "id-mine.private", Hostname: "mine.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+		{ID: "id-manual.private", Hostname: "manual.private", TunnelID: testTunnel, Comment: "hand-created"},
 	}}
-	p := strictProvider(t, api, "test", "woven")
+	p := strictProvider(t, api, "test", "private")
 
 	// Ask to delete both; only the owned one may actually be deleted.
 	changes := &plan.Changes{Delete: []*endpoint.Endpoint{
-		endpoint.NewEndpoint("mine.woven", endpoint.RecordTypeCNAME, p.resolver.target(testTunnel)),
-		endpoint.NewEndpoint("manual.woven", endpoint.RecordTypeCNAME, p.resolver.target(testTunnel)),
+		endpoint.NewEndpoint("mine.private", endpoint.RecordTypeCNAME, p.resolver.target(testTunnel)),
+		endpoint.NewEndpoint("manual.private", endpoint.RecordTypeCNAME, p.resolver.target(testTunnel)),
 	}}
 	if err := p.ApplyChanges(context.Background(), changes); err != nil {
 		t.Fatalf("ApplyChanges: %v", err)
 	}
-	if len(api.deleted) != 1 || api.deleted[0] != "id-mine.woven" {
-		t.Fatalf("deleted = %v, want only [id-mine.woven] (never the hand-created route)", api.deleted)
+	if len(api.deleted) != 1 || api.deleted[0] != "id-mine.private" {
+		t.Fatalf("deleted = %v, want only [id-mine.private] (never the hand-created route)", api.deleted)
 	}
 }
 
@@ -206,17 +206,17 @@ func TestMultiTunnel_CreateRoutesToMostSpecificTunnel(t *testing.T) {
 	api := &fakeAPI{}
 	p, err := New(Config{
 		Client:       api,
-		TunnelMap:    map[string]string{"woven": t1, "apps.woven": t2},
+		TunnelMap:    map[string]string{"private": t1, "apps.private": t2},
 		OwnerID:      "test",
-		DomainFilter: []string{"woven"},
+		DomainFilter: []string{"private"},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	changes := &plan.Changes{Create: []*endpoint.Endpoint{
-		endpoint.NewEndpoint("svc.apps.woven", endpoint.RecordTypeCNAME, ""), // -> apps.woven tunnel (t2)
-		endpoint.NewEndpoint("bare.woven", endpoint.RecordTypeCNAME, ""),     // -> woven tunnel (t1)
+		endpoint.NewEndpoint("svc.apps.private", endpoint.RecordTypeCNAME, ""), // -> apps.private tunnel (t2)
+		endpoint.NewEndpoint("bare.private", endpoint.RecordTypeCNAME, ""),     // -> private tunnel (t1)
 	}}
 	if err := p.ApplyChanges(context.Background(), changes); err != nil {
 		t.Fatalf("ApplyChanges: %v", err)
@@ -226,24 +226,24 @@ func TestMultiTunnel_CreateRoutesToMostSpecificTunnel(t *testing.T) {
 	for i, h := range api.created {
 		got[h] = api.createdTunnels[i]
 	}
-	if got["svc.apps.woven"] != t2 {
-		t.Errorf("svc.apps.woven bound to %q, want most-specific tunnel %q", got["svc.apps.woven"], t2)
+	if got["svc.apps.private"] != t2 {
+		t.Errorf("svc.apps.private bound to %q, want most-specific tunnel %q", got["svc.apps.private"], t2)
 	}
-	if got["bare.woven"] != t1 {
-		t.Errorf("bare.woven bound to %q, want %q", got["bare.woven"], t1)
+	if got["bare.private"] != t1 {
+		t.Errorf("bare.private bound to %q, want %q", got["bare.private"], t1)
 	}
 }
 
 func TestMultiTunnel_RecordsUsesPerTunnelTarget(t *testing.T) {
 	const t1, t2 = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
 	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
-		{ID: "1", Hostname: "bare.woven", TunnelID: t1},
-		{ID: "2", Hostname: "svc.apps.woven", TunnelID: t2},
+		{ID: "1", Hostname: "bare.private", TunnelID: t1},
+		{ID: "2", Hostname: "svc.apps.private", TunnelID: t2},
 	}}
 	p, err := New(Config{
 		Client:       api,
-		TunnelMap:    map[string]string{"woven": t1, "apps.woven": t2},
-		DomainFilter: []string{"woven"},
+		TunnelMap:    map[string]string{"private": t1, "apps.private": t2},
+		DomainFilter: []string{"private"},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -256,11 +256,11 @@ func TestMultiTunnel_RecordsUsesPerTunnelTarget(t *testing.T) {
 	for _, ep := range eps {
 		targets[ep.DNSName] = ep.Targets[0]
 	}
-	if targets["bare.woven"] != t1+".cfargotunnel.com" {
-		t.Errorf("bare.woven target = %q, want %s tunnel target", targets["bare.woven"], t1)
+	if targets["bare.private"] != t1+".cfargotunnel.com" {
+		t.Errorf("bare.private target = %q, want %s tunnel target", targets["bare.private"], t1)
 	}
-	if targets["svc.apps.woven"] != t2+".cfargotunnel.com" {
-		t.Errorf("svc.apps.woven target = %q, want %s tunnel target", targets["svc.apps.woven"], t2)
+	if targets["svc.apps.private"] != t2+".cfargotunnel.com" {
+		t.Errorf("svc.apps.private target = %q, want %s tunnel target", targets["svc.apps.private"], t2)
 	}
 }
 
