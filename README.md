@@ -144,7 +144,7 @@ provenance + SBOM** attestations, and a source SBOM (`sbom.spdx.json`) is attach
 release. Cut a release by pushing a semver tag:
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0   # builds, scans, signs, and drafts a GitHub release
+git tag v0.3.0 && git push origin v0.3.0   # builds, scans, signs, and drafts a GitHub release
 ```
 
 `deploy/deployment.yaml` pins a released tag (not `:latest`). Bump the pin when you cut a new
@@ -157,7 +157,7 @@ The image is signed keyless via GitHub Actions OIDC; verify the signature and in
 attached provenance/SBOM attestations:
 
 ```sh
-IMG=ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.2.0
+IMG=ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.3.0
 
 # Signature (identity = this repo's release workflow):
 cosign verify "$IMG" \
