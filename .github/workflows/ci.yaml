@@ -21,12 +21,32 @@ permissions:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    # Matrix over both arches the release image actually ships (linux/amd64 + linux/arm64),
+    # on NATIVE runners — free for public repos. Cross-compiling arm64 would type-check it
+    # but never execute it, so -race and the concurrency-sensitive tests would only ever be
+    # proven on amd64. fail-fast:false so an arch-specific failure cannot mask the other arch.
+    name: build-test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      # harden-runner's monitor is x86-only; skip it on the arm64 leg rather than fail there.
+      - name: Harden runner
+        if: runner.arch == 'X64'
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26'
           cache: true
@@ -34,16 +54,32 @@ jobs:
         run: go build ./...
       - name: vet
         run: go vet ./...
+      # -covermode=atomic is required alongside -race. The `integration` build tag is absent,
+      # so the live Cloudflare tests stay excluded here by design.
       - name: test
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+      - name: Upload coverage
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: coverage-${{ matrix.arch }}
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 14
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26'
           cache: true
@@ -56,7 +92,7 @@ jobs:
             exit 1
           fi
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: latest
       - name: govulncheck

@@ -1,0 +1,36 @@
+# Actions are pinned to immutable commit SHAs (supply-chain hardening: a mutable tag like
+# @v7 can be repointed at malicious code). A SHA pin never updates itself, so without this
+# config the pins silently rot and stop receiving security fixes — Dependabot is what makes
+# pinning safe rather than merely frozen. It rewrites the SHA *and* the trailing version
+# comment, so the comments stay accurate.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # One grouped PR instead of ~16 separate ones.
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+      include: scope
+    labels: [dependencies, github-actions]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    # Majors land as individual PRs — they can carry breaking API changes and deserve
+    # to be reviewed one at a time.
+    commit-message:
+      prefix: chore
+      include: scope
+    labels: [dependencies, go]
