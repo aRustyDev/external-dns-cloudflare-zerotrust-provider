@@ -23,7 +23,13 @@
 //	export CF_ACCOUNT_ID=...
 //	export CF_TUNNEL_ID=...        # a throwaway tunnel
 //	# optional: export INTEGRATION_HOSTNAME=extdns-cfzt-it.private
+//	# optional: export INTEGRATION_DOMAIN_FILTER=private   # must match INTEGRATION_HOSTNAME's suffix
 //	go test -tags=integration -v -run TestLive ./test/integration/
+//
+// INTEGRATION_HOSTNAME and INTEGRATION_DOMAIN_FILTER must agree: the provider drops any
+// hostname outside its domain filter, so pointing INTEGRATION_HOSTNAME at a different suffix
+// (e.g. a reserved-for-testing `.test` TLD) without setting the filter too makes
+// TestLiveProviderApplyChanges silently create nothing and then fail on the Records assertion.
 //
 // Each test creates a uniquely-named route, asserts the round-trip, and cleans up after
 // itself (t.Cleanup) even on failure. Nothing here is committed with real credentials.
@@ -33,6 +39,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,11 +58,31 @@ func mustEnv(t *testing.T, key string) string {
 	return v
 }
 
+// defaultTestDomain is the suffix used for generated test hostnames, and the default
+// domain filter. Override both together via INTEGRATION_HOSTNAME / INTEGRATION_DOMAIN_FILTER.
+const defaultTestDomain = "private"
+
 func testHost(t *testing.T) string {
 	if h := os.Getenv("INTEGRATION_HOSTNAME"); h != "" {
 		return h
 	}
-	return fmt.Sprintf("extdns-cfzt-it-%d.private", time.Now().UnixNano())
+	return fmt.Sprintf("extdns-cfzt-it-%d.%s", time.Now().UnixNano(), defaultTestDomain)
+}
+
+// testDomainFilter returns the domain filter the provider under test should be built with.
+// It defaults to the suffix of INTEGRATION_HOSTNAME when that is set, so overriding the test
+// hostname alone cannot silently produce a provider that filters that hostname out.
+func testDomainFilter(t *testing.T) string {
+	t.Helper()
+	if d := os.Getenv("INTEGRATION_DOMAIN_FILTER"); d != "" {
+		return d
+	}
+	if h := os.Getenv("INTEGRATION_HOSTNAME"); h != "" {
+		if i := strings.IndexByte(h, '.'); i >= 0 && i+1 < len(h) {
+			return h[i+1:]
+		}
+	}
+	return defaultTestDomain
 }
 
 // activeHost reports whether an un-deleted route for host exists in routes.
@@ -124,7 +151,7 @@ func TestLiveProviderApplyChanges(t *testing.T) {
 		TunnelID:        tunnel,
 		OwnerID:         "integration-test",
 		OwnershipStrict: true,
-		DomainFilter:    []string{"private"},
+		DomainFilter:    []string{testDomainFilter(t)},
 	})
 	if err != nil {
 		t.Fatalf("New provider: %v", err)
