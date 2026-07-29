@@ -101,9 +101,10 @@ spec:
 
         # --- Cloudflare Zero Trust webhook provider (this project) ---
         - name: webhook
-          # Pin to a released tag. This manifest targets v0.2.0 (ownership-strict, metrics,
-          # multi-tunnel); the image exists once the v0.2.0 git tag is cut.
-          image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.2.0
+          # Pin to a released tag. This manifest targets v0.3.0 (create/list/delete round-trip
+          # verified against the live Cloudflare API); the image exists once the v0.3.0 git tag
+          # is cut.
+          image: ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:0.3.0
           env:
             - name: DOMAIN_FILTER
               value: "private"
