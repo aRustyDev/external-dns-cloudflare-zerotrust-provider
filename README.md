@@ -70,6 +70,7 @@ kubectl apply -f deploy/deployment.yaml
 | `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`) |
 | `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
 | `DRY_RUN` | no | `false` | Log intended route creates/deletes and make **no** mutating Cloudflare call (see [Dry run](#dry-run)) |
+| `ADOPT_UNTAGGED` | no | `false` | Claim a pre-existing route for a managed hostname instead of failing (see [Adopting existing routes](#adopting-existing-routes)) |
 | `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `private`) |
 | `WEBHOOK_LISTEN` | no | `127.0.0.1:8888` | Webhook API listen address (localhost-only by design) |
 | `HEALTH_LISTEN` | no | `0.0.0.0:8080` | Health (`/healthz`, `/readyz`) **and** Prometheus `/metrics` |
@@ -122,6 +123,39 @@ deliberately adopt/manage pre-existing routes regardless of their comment.
 > Strict mode + `--policy=sync` is the safe production combination: deletes are enabled but
 > confined to this instance's own routes.
 
+## Adopting existing routes
+
+Migrating a hostname from another system (typically Terraform) to an annotation hits an
+asymmetry: in strict mode that system's route is **invisible** to `Records()`, so ExternalDNS
+plans a **create** for a hostname that already exists — and Cloudflare **rejects** duplicate
+hostname routes with `HTTP 409` / error `1108`.
+
+Set **`ADOPT_UNTAGGED=true`** and the provider claims the existing route instead, by `PATCH`ing
+its comment to `managed-by=external-dns/<OWNER_ID>`. **The route ID, hostname and tunnel binding
+are untouched**, so the name never stops resolving — a migration becomes a comment rewrite rather
+than a delete/recreate with an NXDOMAIN window per host.
+
+Adoption applies only when all of these hold; otherwise it **refuses with an error** rather than
+taking over something another system believes it owns:
+
+| Condition | Why |
+|---|---|
+| Hostname matches the domain filter | Same rule as every other operation |
+| The route's `tunnel_id` equals the tunnel this hostname resolves to | Adopting across tunnels would silently change where traffic goes |
+| The comment carries no *other* `managed-by=external-dns/<owner>` tag | Never steal a route from a different ExternalDNS instance |
+
+A route already carrying **this** owner's tag is a no-op, so adoption is idempotent and does not
+re-`PATCH` on every reconcile. `DRY_RUN=true` suppresses the `PATCH` as well.
+
+> **`ADOPT_UNTAGGED=true` takes ownership of routes this provider did not create** — including
+> hand-created ones. It is off by default for that reason. Turn it on deliberately, for a
+> migration, and prefer `DRY_RUN=true` first: the dry-run log records each route's **previous**
+> comment, which is the only record of what used to claim it.
+
+Cloudflare's `1108` message reads `Hostname Route already routed to another tunnel` **even when
+the existing route is on the same tunnel** — so read the code, not the message. When adoption is
+off, the provider surfaces that error with a pointer to this flag.
+
 ## Multiple tunnels
 
 Run one instance per tunnel, **or** set `TUNNEL_MAP` to serve several tunnels from one instance:
@@ -141,9 +175,10 @@ Prometheus metrics are exposed on the health port at `/metrics` (the sample mani
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `cfzt_provider_api_requests_total` | counter | `operation` (`list`/`create`/`delete`), `result` (`success`/`error`) | Cloudflare API calls |
+| `cfzt_provider_api_requests_total` | counter | `operation` (`list`/`create`/`delete`/`patch`), `result` (`success`/`error`) | Cloudflare API calls |
 | `cfzt_provider_routes_created_total` | counter | — | Hostname routes created |
 | `cfzt_provider_routes_deleted_total` | counter | — | Hostname routes deleted |
+| `cfzt_provider_routes_adopted_total` | counter | — | Pre-existing routes claimed in place (not counted as creates) |
 | `cfzt_provider_apply_duration_seconds` | histogram | — | `ApplyChanges` reconcile duration |
 | `cfzt_provider_records_managed` | gauge | — | Managed routes seen on the last `Records()` |
 | `cfzt_provider_dry_run` | gauge | — | `1` while `DRY_RUN` suppresses all mutations, else `0` |

@@ -20,6 +20,7 @@
 //
 //	List   GET    /accounts/{account_id}/zerotrust/routes/hostname
 //	Create POST   /accounts/{account_id}/zerotrust/routes/hostname   {hostname, tunnel_id, comment}
+//	Patch  PATCH  /accounts/{account_id}/zerotrust/routes/hostname/{id}  {comment}
 //	Delete DELETE /accounts/{account_id}/zerotrust/routes/hostname/{id}
 //
 // It intentionally has no third-party dependencies so it stays trivially testable.
@@ -29,6 +30,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +41,15 @@ import (
 
 // DefaultBaseURL is the Cloudflare API v4 root.
 const DefaultBaseURL = "https://api.cloudflare.com/client/v4"
+
+// ErrCodeHostnameAlreadyRouted is the Cloudflare error code returned when creating a hostname
+// route that already exists. LIVE-VERIFIED: Cloudflare REJECTS duplicates with HTTP 409 and this
+// code — it does not silently create a second route.
+//
+// Its message reads "Hostname Route already routed to another tunnel" even when the existing
+// route is on the SAME tunnel, so treat the code as "hostname already routed", full stop, and
+// never read the message as evidence of a tunnel mismatch.
+const ErrCodeHostnameAlreadyRouted = 1108
 
 // HostnameRoute is a Zero Trust private hostname route (hostname bound to a tunnel).
 type HostnameRoute struct {
@@ -142,9 +153,48 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		}
 	}
 	if resp.StatusCode >= 300 || !out.Success {
-		return &out, fmt.Errorf("cloudflare API %s %s: status %d: %s", method, path, resp.StatusCode, out.errString())
+		return &out, &APIError{
+			Method: method, Path: path, StatusCode: resp.StatusCode,
+			Codes: out.errCodes(), Message: out.errString(),
+		}
 	}
 	return &out, nil
+}
+
+// APIError describes a failed Cloudflare call. It preserves the vendor error CODES so callers can
+// act on specific ones (e.g. ErrCodeHostnameAlreadyRouted) instead of matching on message text.
+type APIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Codes      []int
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("cloudflare API %s %s: status %d: %s", e.Method, e.Path, e.StatusCode, e.Message)
+}
+
+// HasCode reports whether err is (or wraps) a Cloudflare APIError carrying the given error code.
+func HasCode(err error, code int) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	for _, c := range apiErr.Codes {
+		if c == code {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *apiResponse) errCodes() []int {
+	out := make([]int, 0, len(r.Errors))
+	for _, e := range r.Errors {
+		out = append(out, e.Code)
+	}
+	return out
 }
 
 func (r *apiResponse) errString() string {
@@ -222,6 +272,28 @@ func (c *Client) CreateHostnameRoute(ctx context.Context, hostname, tunnelID, co
 	var route HostnameRoute
 	if err := json.Unmarshal(resp.Result, &route); err != nil {
 		return nil, fmt.Errorf("decode created route: %w", err)
+	}
+	return &route, nil
+}
+
+type patchRequest struct {
+	Comment string `json:"comment"`
+}
+
+// PatchHostnameRouteComment rewrites ONLY the comment of an existing route. This is the adoption
+// primitive: LIVE-VERIFIED that a comment-only PATCH returns HTTP 200 with the SAME route id and
+// an unchanged hostname and tunnel_id, so claiming a route causes no DNS interruption at all.
+//
+// The API also accepts a full body (hostname + tunnel_id + comment), but comment-only is used
+// deliberately — it cannot accidentally retarget the hostname to a different tunnel.
+func (c *Client) PatchHostnameRouteComment(ctx context.Context, id, comment string) (*HostnameRoute, error) {
+	resp, err := c.do(ctx, http.MethodPatch, c.routesPath()+"/"+id, nil, patchRequest{Comment: comment})
+	if err != nil {
+		return nil, err
+	}
+	var route HostnameRoute
+	if err := json.Unmarshal(resp.Result, &route); err != nil {
+		return nil, fmt.Errorf("decode patched route: %w", err)
 	}
 	return &route, nil
 }

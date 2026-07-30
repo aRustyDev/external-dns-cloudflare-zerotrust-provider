@@ -52,6 +52,7 @@ func main() {
 	ownerID := envOr("OWNER_ID", "default")
 	ownershipStrict := envBool("OWNERSHIP_STRICT", true)
 	dryRun := envBool("DRY_RUN", false)
+	adoptUntagged := envBool("ADOPT_UNTAGGED", false)
 	domainFilter := splitCSV(os.Getenv("DOMAIN_FILTER"))
 	webhookListen := envOr("WEBHOOK_LISTEN", "127.0.0.1:8888")
 	healthListen := envOr("HEALTH_LISTEN", "0.0.0.0:8080")
@@ -68,6 +69,7 @@ func main() {
 		OwnerID:         ownerID,
 		OwnershipStrict: ownershipStrict,
 		DryRun:          dryRun,
+		AdoptUntagged:   adoptUntagged,
 		DomainFilter:    domainFilter,
 		Metrics:         m,
 		Logger:          log,
@@ -83,11 +85,16 @@ func main() {
 		"webhook", webhookListen, "health", healthListen,
 		"tunnel_id", tunnelID, "tunnel_map", tunnelMap, "account_id", accountID,
 		"owner_id", ownerID, "ownership_strict", ownershipStrict, "dry_run", dryRun,
-		"domain_filter", domainFilter)
+		"adopt_untagged", adoptUntagged, "domain_filter", domainFilter)
 
 	if dryRun {
 		log.Warn("DRY_RUN=true: NO Cloudflare route will be created or deleted; " +
 			"intended changes are logged only. Unset DRY_RUN to apply changes.")
+	}
+	if adoptUntagged {
+		log.Warn("ADOPT_UNTAGGED=true: a create for a hostname that already has a route will " +
+			"CLAIM that route by rewriting its comment, taking ownership from whatever created it " +
+			"(e.g. Terraform). The route id and tunnel binding are unchanged, so DNS never breaks.")
 	}
 
 	// Blocks. Serves GET /, GET /records, POST /records, POST /adjustendpoints.

@@ -66,7 +66,14 @@ func testHost(t *testing.T) string {
 	if h := os.Getenv("INTEGRATION_HOSTNAME"); h != "" {
 		return h
 	}
-	return fmt.Sprintf("extdns-cfzt-it-%d.%s", time.Now().UnixNano(), defaultTestDomain)
+	// Generate under the configured filter's suffix, not blindly under defaultTestDomain: setting
+	// INTEGRATION_DOMAIN_FILTER alone would otherwise produce a hostname the provider filters
+	// out, and the tests would create nothing and then fail on an unrelated-looking assertion.
+	suffix := defaultTestDomain
+	if d := os.Getenv("INTEGRATION_DOMAIN_FILTER"); d != "" {
+		suffix = d
+	}
+	return fmt.Sprintf("extdns-cfzt-it-%d.%s", time.Now().UnixNano(), suffix)
 }
 
 // testDomainFilter returns the domain filter the provider under test should be built with.
