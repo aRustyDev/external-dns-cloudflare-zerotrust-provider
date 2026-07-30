@@ -24,8 +24,9 @@ A `<name>.private` name needs **two** independent things to resolve over WARP:
 1. **A Cloudflare Zero Trust hostname route** binding the name to the tunnel — **this provider
    manages this half** (via the `zerotrust/routes/hostname` API).
 2. **An in-cluster CoreDNS answer** (`<name> → <svc>.<ns>.svc.cluster.local`) so cloudflared can
-   forward to the Service ClusterIP — **NOT managed here.** Handle it with a CoreDNS fragment,
-   the ExternalDNS `coredns`/etcd source, or your existing mechanism.
+   forward to the Service ClusterIP — **optionally managed here**, see
+   [The CoreDNS leg](#the-coredns-leg). Off by default; enable it and one annotation drives both
+   legs, otherwise supply this half yourself.
 
 Cloudflare's stock ExternalDNS provider manages *public DNS-zone records*, not Zero Trust
 tunnel routes — which is why this webhook exists.
@@ -71,6 +72,10 @@ kubectl apply -f deploy/deployment.yaml
 | `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
 | `DRY_RUN` | no | `false` | Log intended route creates/deletes and make **no** mutating Cloudflare call (see [Dry run](#dry-run)) |
 | `ADOPT_UNTAGGED` | no | `false` | Claim a pre-existing route for a managed hostname instead of failing (see [Adopting existing routes](#adopting-existing-routes)) |
+| `COREDNS_CONFIGMAP` | no | — | `<namespace>/<name>` of the CoreDNS fragment ConfigMap. Setting it enables the CoreDNS leg (see [The CoreDNS leg](#the-coredns-leg)) |
+| `COREDNS_FRAGMENT_KEY` | no | `zz-external-dns.override` | ConfigMap key this instance owns |
+| `COREDNS_FIELD_MANAGER` | no | `external-dns` | Server-side-apply field manager; **must be unique to this writer** |
+| `CLUSTER_DOMAIN` | no | `cluster.local` | Cluster domain used to build `<svc>.<ns>.svc.<domain>` |
 | `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `private`) |
 | `WEBHOOK_LISTEN` | no | `127.0.0.1:8888` | Webhook API listen address (localhost-only by design) |
 | `HEALTH_LISTEN` | no | `0.0.0.0:8080` | Health (`/healthz`, `/readyz`) **and** Prometheus `/metrics` |
@@ -156,6 +161,67 @@ Cloudflare's `1108` message reads `Hostname Route already routed to another tunn
 the existing route is on the same tunnel** — so read the code, not the message. When adoption is
 off, the provider surfaces that error with a pointer to this flag.
 
+## The CoreDNS leg
+
+By default this provider manages only the Cloudflare route, and a name does **not** resolve until
+something else supplies the in-cluster answer. Set **`COREDNS_CONFIGMAP=<namespace>/<name>`** and it
+also owns that half, so one Service annotation drives both legs and adding a private hostname stops
+being a two-place edit.
+
+It works by claiming **one key** of a CoreDNS *fragment* ConfigMap:
+
+```
+# zz-external-dns.override — Managed by external-dns (cfzt webhook provider). Do not edit by hand.
+rewrite name exact foo.edns.woven foo.apps.svc.cluster.local
+```
+
+**Prerequisite:** your CoreDNS `Corefile` must already import the fragment directory, with that
+ConfigMap mounted there:
+
+```
+import /etc/coredns-custom/*.override
+```
+
+That is all the dynamism needed — CoreDNS hot-reloads on ConfigMap change, so **no etcd and no
+CoreDNS reconfiguration.** The provider writes only its own key, under its own **field manager**, so
+it can never disturb another owner's key or the base `Corefile`. Give each writer a unique
+`COREDNS_FIELD_MANAGER`; sharing one is how keys get silently taken over.
+
+RBAC is deliberately tiny — `get` + `patch` on that **one** ConfigMap by name (see
+`deploy/deployment.yaml`). No `create`, no `update`, no cluster-wide ConfigMap access.
+
+### Where the Service name comes from
+
+A CoreDNS rewrite maps **name → name**, not name → IP, so the provider must know the backing
+Service. ExternalDNS supplies it in each endpoint's `resource` label (`service/<ns>/<name>`), set by
+the **service source**. Consequences worth knowing:
+
+- Use `--source=service`. A source that reports something else (e.g. `ingress/<ns>/<name>`) is
+  **rejected with an error**, because an Ingress cannot be mapped to one cluster-local name.
+- An endpoint with no `resource` label is an error too. Creating the route anyway would leave a
+  hostname that resolves nowhere — better to fail loudly.
+
+### Ordering, and why it is what it is
+
+Within one reconcile the fragment is written **first, in a single apply**, then Cloudflare.
+
+That order is load-bearing. ExternalDNS computes its plan from `Records()`, which reads Cloudflare —
+so Cloudflare is the plan's source of truth. If Cloudflare went first and the ConfigMap write then
+failed, the next reconcile would see the route already present, plan no further create, and the
+CoreDNS answer would never appear: a permanently half-configured hostname with nothing left to retry
+it. With Cloudflare last, any failure leaves the plan free to re-issue the whole change, and the
+fragment write is idempotent, so retries converge.
+
+Both orders leave a brief window where a hostname has one leg and not the other; that window is
+unavoidable (a route with no answer and an answer with no route both fail to resolve). Only
+recovery-after-failure distinguishes them.
+
+A reconcile that changes nothing does **not** write, since every write bumps `resourceVersion` and
+can trigger a CoreDNS reload.
+
+> **Interaction with IaC drift guards.** This key is written by a *runtime* writer, not by your IaC,
+> so a guard that diffs rendered IaC against the live ConfigMap will see it as drift. Allowlist it.
+
 ## Multiple tunnels
 
 Run one instance per tunnel, **or** set `TUNNEL_MAP` to serve several tunnels from one instance:
@@ -182,7 +248,9 @@ Prometheus metrics are exposed on the health port at `/metrics` (the sample mani
 | `cfzt_provider_apply_duration_seconds` | histogram | — | `ApplyChanges` reconcile duration |
 | `cfzt_provider_records_managed` | gauge | — | Managed routes seen on the last `Records()` |
 | `cfzt_provider_dry_run` | gauge | — | `1` while `DRY_RUN` suppresses all mutations, else `0` |
-| `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`) | Mutations suppressed by dry run |
+| `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`/`patch`/`fragment`) | Mutations suppressed by dry run |
+| `cfzt_provider_coredns_writes_total` | counter | `result` | Applies of the managed CoreDNS fragment key |
+| `cfzt_provider_coredns_rewrites` | gauge | — | Rewrites in the managed key after the last write |
 
 ## Development
 

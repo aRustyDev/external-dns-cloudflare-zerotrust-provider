@@ -34,6 +34,10 @@ const (
 	OpPatch  = "patch"
 )
 
+// OpFragment labels dry-run suppression of a CoreDNS fragment write. It is deliberately NOT a
+// value for api_requests_total, which counts Cloudflare calls only.
+const OpFragment = "fragment"
+
 // Metrics holds the provider's Prometheus collectors.
 type Metrics struct {
 	apiRequests    *prometheus.CounterVec
@@ -44,6 +48,8 @@ type Metrics struct {
 	recordsManaged prometheus.Gauge
 	dryRun         prometheus.Gauge
 	dryRunSkipped  *prometheus.CounterVec
+	corednsWrites  *prometheus.CounterVec
+	corednsRewrite prometheus.Gauge
 }
 
 // New builds the collectors (unregistered). Call MustRegister to attach them to a registry.
@@ -82,6 +88,14 @@ func New() *Metrics {
 			Namespace: namespace, Subsystem: subsystem, Name: "dry_run_skipped_total",
 			Help: "Mutating Cloudflare calls suppressed by dry-run mode, by operation.",
 		}, []string{"operation"}),
+		corednsWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "coredns_writes_total",
+			Help: "Server-side applies of the managed CoreDNS fragment key, by result.",
+		}, []string{"result"}),
+		corednsRewrite: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "coredns_rewrites",
+			Help: "Rewrites present in the managed CoreDNS fragment key after the last write.",
+		}),
 	}
 }
 
@@ -96,6 +110,8 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.recordsManaged,
 		m.dryRun,
 		m.dryRunSkipped,
+		m.corednsWrites,
+		m.corednsRewrite,
 	)
 }
 
@@ -134,6 +150,27 @@ func (m *Metrics) RouteAdopted() {
 		return
 	}
 	m.routesAdopted.Inc()
+}
+
+// CoreDNSWrite records one server-side apply of the CoreDNS fragment key.
+func (m *Metrics) CoreDNSWrite(err error) {
+	if m == nil {
+		return
+	}
+	result := "success"
+	if err != nil {
+		result = "error"
+	}
+	m.corednsWrites.WithLabelValues(result).Inc()
+}
+
+// SetCoreDNSRewrites records how many rewrites the managed fragment key holds. Pairs with
+// records_managed: a lasting gap between the two means one leg of a hostname is missing.
+func (m *Metrics) SetCoreDNSRewrites(n int) {
+	if m == nil {
+		return
+	}
+	m.corednsRewrite.Set(float64(n))
 }
 
 // ObserveApply records the duration of one ApplyChanges call, in seconds.

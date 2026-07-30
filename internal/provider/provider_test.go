@@ -732,6 +732,273 @@ func TestAdopt_DryRunSuppressesThePatch(t *testing.T) {
 	}
 }
 
+// --- CoreDNS leg / leg 2 (infra-415m.10) ----------------------------------------------------
+
+// fakeFragment records calls and can fail on demand. It also stamps an ordering marker so tests
+// can prove the fragment write happens BEFORE any Cloudflare mutation.
+type fakeFragment struct {
+	applies  []fragmentCall
+	err      error
+	order    *[]string
+	rewrites map[string]string
+}
+
+type fragmentCall struct {
+	add    map[string]string
+	remove []string
+}
+
+func (f *fakeFragment) Key() string { return "zz-external-dns.override" }
+
+func (f *fakeFragment) ServiceTarget(resource string) (string, error) {
+	kind, rest, ok := strings.Cut(resource, "/")
+	if !ok || kind != "service" {
+		return "", fmt.Errorf("unsupported resource %q", resource)
+	}
+	ns, name, ok := strings.Cut(rest, "/")
+	if !ok || ns == "" || name == "" {
+		return "", fmt.Errorf("malformed resource %q", resource)
+	}
+	return name + "." + ns + ".svc.cluster.local", nil
+}
+
+func (f *fakeFragment) Apply(_ context.Context, add map[string]string, remove []string) (map[string]string, error) {
+	if f.order != nil {
+		*f.order = append(*f.order, "fragment")
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.applies = append(f.applies, fragmentCall{add: add, remove: remove})
+	if f.rewrites == nil {
+		f.rewrites = map[string]string{}
+	}
+	for _, h := range remove {
+		delete(f.rewrites, h)
+	}
+	for h, t := range add {
+		f.rewrites[h] = t
+	}
+	return f.rewrites, nil
+}
+
+// orderingAPI wraps fakeAPI to record when Cloudflare mutations happen relative to the fragment.
+type orderingAPI struct {
+	*fakeAPI
+	order *[]string
+}
+
+func (o *orderingAPI) CreateHostnameRoute(ctx context.Context, hostname, tunnelID, comment string) (*cloudflare.HostnameRoute, error) {
+	*o.order = append(*o.order, "cf-create")
+	return o.fakeAPI.CreateHostnameRoute(ctx, hostname, tunnelID, comment)
+}
+
+func (o *orderingAPI) DeleteHostnameRoute(ctx context.Context, id string) error {
+	*o.order = append(*o.order, "cf-delete")
+	return o.fakeAPI.DeleteHostnameRoute(ctx, id)
+}
+
+func corednsHarness(t *testing.T, api routeAPI, frag FragmentWriter, dryRun bool) (*Provider, *prometheus.Registry, *bytes.Buffer) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client: api, TunnelID: testTunnel, OwnerID: "test", OwnershipStrict: true,
+		CoreDNS: frag, DryRun: dryRun, DomainFilter: []string{"woven"},
+		Metrics: m, Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p, reg, &logs
+}
+
+func svcEndpoint(host, resource string) *endpoint.Endpoint {
+	ep := endpoint.NewEndpoint(host, endpoint.RecordTypeCNAME, "")
+	if resource != "" {
+		ep.Labels[endpoint.ResourceLabelKey] = resource
+	}
+	return ep
+}
+
+func TestCoreDNS_WritesBothLegsFromOneAnnotation(t *testing.T) {
+	api := &fakeAPI{}
+	frag := &fakeFragment{}
+	p, reg, _ := corednsHarness(t, api, frag, false)
+
+	changes := &plan.Changes{Create: []*endpoint.Endpoint{
+		svcEndpoint("foo.edns.woven", "service/apps/foo"),
+	}}
+	if err := p.ApplyChanges(context.Background(), changes); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+
+	// Leg 1.
+	if len(api.created) != 1 || api.created[0] != "foo.edns.woven" {
+		t.Errorf("cloudflare route not created: %v", api.created)
+	}
+	// Leg 2.
+	if len(frag.applies) != 1 {
+		t.Fatalf("want 1 fragment write, got %d", len(frag.applies))
+	}
+	if got := frag.applies[0].add["foo.edns.woven"]; got != "foo.apps.svc.cluster.local" {
+		t.Errorf("rewrite target = %q, want the Service's cluster-local name", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_coredns_rewrites", nil); got != 1 {
+		t.Errorf("coredns_rewrites = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_coredns_writes_total", map[string]string{"result": "success"}); got != 1 {
+		t.Errorf("coredns_writes_total{success} = %v, want 1", got)
+	}
+}
+
+// THE convergence property: the fragment must be written BEFORE Cloudflare. ExternalDNS plans from
+// Records(), which reads Cloudflare, so if Cloudflare went first a failed fragment write would
+// leave the plan with nothing to retry and the hostname permanently half-configured.
+func TestCoreDNS_FragmentIsWrittenBeforeCloudflare(t *testing.T) {
+	var order []string
+	base := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-old.edns.woven", Hostname: "old.edns.woven", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+	api := &orderingAPI{fakeAPI: base, order: &order}
+	frag := &fakeFragment{order: &order}
+	p, _, _ := corednsHarness(t, api, frag, false)
+
+	changes := &plan.Changes{
+		Create: []*endpoint.Endpoint{svcEndpoint("new.edns.woven", "service/apps/new")},
+		Delete: []*endpoint.Endpoint{svcEndpoint("old.edns.woven", "service/apps/old")},
+	}
+	if err := p.ApplyChanges(context.Background(), changes); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(order) == 0 || order[0] != "fragment" {
+		t.Fatalf("fragment must be written first, got order %v", order)
+	}
+	for _, step := range order[1:] {
+		if step == "fragment" {
+			t.Errorf("fragment written more than once: %v (want ONE batched write)", order)
+		}
+	}
+}
+
+// A failed fragment write must abort before Cloudflare is touched, so the next reconcile still
+// plans the same change.
+func TestCoreDNS_WriteFailureLeavesCloudflareUntouched(t *testing.T) {
+	api := &fakeAPI{}
+	frag := &fakeFragment{err: errors.New("configmap conflict")}
+	p, reg, _ := corednsHarness(t, api, frag, false)
+
+	err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{svcEndpoint("foo.edns.woven", "service/apps/foo")},
+	})
+	if err == nil {
+		t.Fatal("want an error when the fragment write fails")
+	}
+	if len(api.created) != 0 {
+		t.Errorf("cloudflare was mutated despite the fragment failing: %v", api.created)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_coredns_writes_total", map[string]string{"result": "error"}); got != 1 {
+		t.Errorf("coredns_writes_total{error} = %v, want 1", got)
+	}
+}
+
+// Without the resource label the backing Service is unknown. Creating leg 1 anyway would yield a
+// hostname that never resolves, so this must fail loudly instead.
+func TestCoreDNS_MissingResourceLabelIsAnError(t *testing.T) {
+	api := &fakeAPI{}
+	frag := &fakeFragment{}
+	p, _, _ := corednsHarness(t, api, frag, false)
+
+	err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{svcEndpoint("foo.edns.woven", "")},
+	})
+	if err == nil {
+		t.Fatal("want an error when the endpoint carries no resource label")
+	}
+	if !strings.Contains(err.Error(), "resource") {
+		t.Errorf("error should name the missing label; got: %v", err)
+	}
+	if len(api.created) != 0 || len(frag.applies) != 0 {
+		t.Error("nothing should have been written")
+	}
+}
+
+// A non-Service resource (e.g. an Ingress) cannot be mapped to one cluster-local name.
+func TestCoreDNS_NonServiceResourceIsAnError(t *testing.T) {
+	p, _, _ := corednsHarness(t, &fakeAPI{}, &fakeFragment{}, false)
+	err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{svcEndpoint("foo.edns.woven", "ingress/apps/foo")},
+	})
+	if err == nil {
+		t.Fatal("want an error for a non-Service resource")
+	}
+}
+
+func TestCoreDNS_DeleteRemovesTheRewrite(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-gone.edns.woven", Hostname: "gone.edns.woven", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+	frag := &fakeFragment{rewrites: map[string]string{"gone.edns.woven": "gone.apps.svc.cluster.local"}}
+	p, _, _ := corednsHarness(t, api, frag, false)
+
+	if err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Delete: []*endpoint.Endpoint{svcEndpoint("gone.edns.woven", "service/apps/gone")},
+	}); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(frag.applies) != 1 || len(frag.applies[0].remove) != 1 ||
+		frag.applies[0].remove[0] != "gone.edns.woven" {
+		t.Fatalf("fragment removals = %+v", frag.applies)
+	}
+	if _, still := frag.rewrites["gone.edns.woven"]; still {
+		t.Error("rewrite survived the delete")
+	}
+	if len(api.deleted) != 1 {
+		t.Errorf("cloudflare route not deleted: %v", api.deleted)
+	}
+}
+
+// DRY_RUN must gate the ConfigMap write too, or the guard has a hole in the leg that mutates the
+// cluster rather than Cloudflare.
+func TestCoreDNS_DryRunSuppressesTheWrite(t *testing.T) {
+	api := &fakeAPI{}
+	frag := &fakeFragment{}
+	p, reg, logs := corednsHarness(t, api, frag, true)
+
+	if err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{svcEndpoint("foo.edns.woven", "service/apps/foo")},
+	}); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(frag.applies) != 0 {
+		t.Fatalf("dry run wrote the fragment: %+v", frag.applies)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": "fragment"}); got != 1 {
+		t.Errorf("dry_run_skipped_total{fragment} = %v, want 1", got)
+	}
+	if out := logs.String(); !strings.Contains(out, "would UPDATE the CoreDNS fragment") {
+		t.Errorf("dry run should report the intended fragment change; got:\n%s", out)
+	}
+}
+
+// Leg 2 is opt-in: with no fragment writer the provider must behave exactly as before, and must
+// NOT require the resource label.
+func TestCoreDNS_DisabledByDefault(t *testing.T) {
+	api := &fakeAPI{}
+	p, _, _ := corednsHarness(t, api, nil, false)
+
+	if err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{svcEndpoint("foo.edns.woven", "")}, // no label at all
+	}); err != nil {
+		t.Fatalf("with no fragment writer this must succeed: %v", err)
+	}
+	if len(api.created) != 1 {
+		t.Errorf("cloudflare route should still be created: %v", api.created)
+	}
+}
+
 func names(eps []*endpoint.Endpoint) []string {
 	out := make([]string, 0, len(eps))
 	for _, e := range eps {

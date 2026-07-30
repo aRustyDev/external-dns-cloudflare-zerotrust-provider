@@ -21,9 +21,10 @@
 // Zero Trust hostname-route CRUD on the tunnel selected for each hostname (a single tunnel,
 // or the most-specific match from a domain->tunnel map).
 //
-// This provider owns ONLY the Cloudflare route half of a `.private` name. The in-cluster
-// CoreDNS answer (name -> Service ClusterIP) is a separate concern (a CoreDNS fragment / etcd
-// source) and is intentionally out of scope here.
+// Legs: a private name needs BOTH a Cloudflare hostname route AND an in-cluster CoreDNS answer.
+// This provider always owns the route; it ALSO owns the CoreDNS answer when a fragment writer is
+// configured (Config.CoreDNS), so one Service annotation drives both. With no fragment writer —
+// the default — the CoreDNS half is left to whatever manages it today.
 //
 // Ownership: routes are tagged with a "managed-by=external-dns/<owner>" comment. In
 // ownership-strict mode the provider only ever reads back and deletes routes carrying its own
@@ -56,6 +57,23 @@ const recordType = endpoint.RecordTypeCNAME
 // managedByPrefix is the comment prefix stamped on every route this project creates.
 const managedByPrefix = "managed-by=external-dns"
 
+// FragmentWriter owns the in-cluster leg of a managed hostname: the CoreDNS answer mapping the
+// name to a Service's cluster-local name. Optional — a nil FragmentWriter means this provider
+// manages only the Cloudflare route half, which is the default.
+//
+// Exported so callers can hold one as an interface. That matters for more than tidiness: assigning
+// a nil CONCRETE implementation to Config.CoreDNS would produce a non-nil interface and panic on
+// first use, so a caller deciding at runtime whether to enable leg 2 must be able to name this
+// type and keep its nil untyped.
+type FragmentWriter interface {
+	// ServiceTarget maps an ExternalDNS resource label to a cluster-local name.
+	ServiceTarget(resource string) (string, error)
+	// Apply adds and removes rewrites, returning the resulting set.
+	Apply(ctx context.Context, add map[string]string, remove []string) (map[string]string, error)
+	// Key names the ConfigMap key being managed (for logs).
+	Key() string
+}
+
 // routeAPI is the subset of the Cloudflare client the provider needs (interface for testability).
 type routeAPI interface {
 	ListHostnameRoutes(ctx context.Context, tunnelID string) ([]cloudflare.HostnameRoute, error)
@@ -74,6 +92,7 @@ type Provider struct {
 	ownershipStrict bool
 	dryRun          bool
 	adoptUntagged   bool
+	coredns         FragmentWriter
 	domainFilter    *endpoint.DomainFilter
 	metrics         *metrics.Metrics
 	log             *slog.Logger
@@ -102,7 +121,11 @@ type Config struct {
 	// failing. The route id, hostname and tunnel binding are untouched, so adoption causes no
 	// DNS interruption. Off by default: adoption takes over a route another system created.
 	AdoptUntagged bool
-	DomainFilter  []string
+	// CoreDNS, when non-nil, makes the provider ALSO own the in-cluster CoreDNS answer for every
+	// managed hostname, so one Service annotation drives both legs. Nil (the default) leaves the
+	// CoreDNS half to whatever manages it today.
+	CoreDNS      FragmentWriter
+	DomainFilter []string
 	// Metrics is optional; nil disables metrics (all metric calls are no-ops).
 	Metrics *metrics.Metrics
 	// Logger is optional; nil uses slog.Default(). Dry-run reports are logged here, so a
@@ -143,6 +166,7 @@ func New(cfg Config) (*Provider, error) {
 		ownershipStrict: cfg.OwnershipStrict,
 		dryRun:          cfg.DryRun,
 		adoptUntagged:   cfg.AdoptUntagged,
+		coredns:         cfg.CoreDNS,
 		domainFilter:    endpoint.NewDomainFilter(cfg.DomainFilter),
 		metrics:         cfg.Metrics,
 		log:             logger,
@@ -300,6 +324,10 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		}
 	}
 
+	if err := p.applyCoreDNS(ctx, changes); err != nil {
+		return err
+	}
+
 	for _, ep := range changes.Create {
 		if !p.domainFilter.Match(ep.DNSName) {
 			continue
@@ -357,6 +385,75 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		}
 		p.metrics.RouteDeleted()
 	}
+	return nil
+}
+
+// applyCoreDNS writes the in-cluster leg for this plan, in ONE server-side apply, BEFORE any
+// Cloudflare mutation. A nil fragment writer makes it a no-op.
+//
+// The ordering is load-bearing, not stylistic. ExternalDNS computes its plan from Records(), which
+// reads Cloudflare — so Cloudflare is the plan's source of truth. If Cloudflare were mutated first
+// and the fragment write then failed, the next reconcile would see the route already present, plan
+// no further Create, and the CoreDNS answer would never appear: the hostname would stay
+// unresolvable with nothing left to retry it. Writing Cloudflare LAST means any failure leaves the
+// plan able to re-issue the whole change, and Fragment.Apply is idempotent, so retries converge.
+// The same argument runs in reverse for deletes, which is why both legs of both directions are
+// handled here rather than interleaved with the Cloudflare loops.
+//
+// Both orderings leave a brief window where a hostname has one leg and not the other; that window
+// is unavoidable (a route without an answer and an answer without a route both fail to resolve).
+// Only convergence-after-failure distinguishes them.
+func (p *Provider) applyCoreDNS(ctx context.Context, changes *plan.Changes) error {
+	if p.coredns == nil {
+		return nil
+	}
+
+	add := map[string]string{}
+	for _, ep := range changes.Create {
+		if !p.domainFilter.Match(ep.DNSName) {
+			continue
+		}
+		resource := ep.Labels[endpoint.ResourceLabelKey]
+		if resource == "" {
+			return fmt.Errorf("cannot write the CoreDNS answer for %q: the endpoint carries no %q "+
+				"label, so the backing Service is unknown (ExternalDNS sets it for --source=service)",
+				ep.DNSName, endpoint.ResourceLabelKey)
+		}
+		target, err := p.coredns.ServiceTarget(resource)
+		if err != nil {
+			return fmt.Errorf("CoreDNS answer for %q: %w", ep.DNSName, err)
+		}
+		add[strings.ToLower(ep.DNSName)] = target
+	}
+
+	// Deletes are listed unconditionally rather than filtered by ownership: we only ever ADD
+	// rewrites for hostnames we manage, so removing one we never added is a no-op inside Apply.
+	var remove []string
+	for _, ep := range changes.Delete {
+		if !p.domainFilter.Match(ep.DNSName) {
+			continue
+		}
+		remove = append(remove, strings.ToLower(ep.DNSName))
+	}
+
+	if len(add) == 0 && len(remove) == 0 {
+		return nil
+	}
+	if p.dryRun {
+		p.log.Info("dry run: would UPDATE the CoreDNS fragment",
+			"key", p.coredns.Key(), "add", add, "remove", remove)
+		p.metrics.DryRunSkipped(metrics.OpFragment)
+		return nil
+	}
+
+	after, err := p.coredns.Apply(ctx, add, remove)
+	p.metrics.CoreDNSWrite(err)
+	if err != nil {
+		return fmt.Errorf("update CoreDNS fragment %q: %w", p.coredns.Key(), err)
+	}
+	p.metrics.SetCoreDNSRewrites(len(after))
+	p.log.Info("updated CoreDNS fragment", "key", p.coredns.Key(),
+		"added", len(add), "removed", len(remove), "rewrites", len(after))
 	return nil
 }
 
