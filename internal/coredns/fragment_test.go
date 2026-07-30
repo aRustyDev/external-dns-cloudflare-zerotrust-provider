@@ -247,7 +247,7 @@ func TestRender_IsDeterministic(t *testing.T) {
 	ia := strings.Index(first, "a.edns.woven")
 	ib := strings.Index(first, "b.edns.woven")
 	ic := strings.Index(first, "c.edns.woven")
-	if !(ia < ib && ib < ic) {
+	if ia >= ib || ib >= ic {
 		t.Errorf("rewrites are not sorted:\n%s", first)
 	}
 }
