@@ -29,11 +29,16 @@
 // ownership-strict mode the provider only ever reads back and deletes routes carrying its own
 // owner tag, so it cannot disturb routes created by Terraform or by hand — important where an
 // external system (e.g. Terraform) is the declared sole owner of some `.private` routes.
+//
+// Dry run: ExternalDNS's own --dry-run flag is silently INERT for webhook providers (see
+// docs/upstream-dry-run-gap.md), so this provider implements its own DryRun, which is the only
+// thing that actually protects a live Cloudflare account.
 package provider
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -66,8 +71,10 @@ type Provider struct {
 	resolver        *tunnelResolver
 	ownerID         string
 	ownershipStrict bool
+	dryRun          bool
 	domainFilter    *endpoint.DomainFilter
 	metrics         *metrics.Metrics
+	log             *slog.Logger
 }
 
 // Config configures a Provider.
@@ -83,9 +90,17 @@ type Config struct {
 	OwnerID string
 	// OwnershipStrict, when true, restricts Records()/deletes to routes this owner created.
 	OwnershipStrict bool
-	DomainFilter    []string
+	// DryRun, when true, makes ApplyChanges log every intended create/delete and return nil
+	// WITHOUT issuing any mutating Cloudflare call. Read-only list calls still happen, so the
+	// logged plan reflects live state. This exists because ExternalDNS's --dry-run does NOT
+	// reach a webhook provider — see docs/upstream-dry-run-gap.md.
+	DryRun       bool
+	DomainFilter []string
 	// Metrics is optional; nil disables metrics (all metric calls are no-ops).
 	Metrics *metrics.Metrics
+	// Logger is optional; nil uses slog.Default(). Dry-run reports are logged here, so a
+	// discarding logger makes DryRun silent.
+	Logger *slog.Logger
 }
 
 // New builds a Provider.
@@ -106,14 +121,23 @@ func New(cfg Config) (*Provider, error) {
 	default:
 		return nil, fmt.Errorf("a tunnel id or a non-empty tunnel map is required")
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	// Publish the gauge at construction so it reads correctly from the first scrape, not just
+	// after the first reconcile.
+	cfg.Metrics.SetDryRun(cfg.DryRun)
 	return &Provider{
 		BaseProvider:    &extprovider.BaseProvider{},
 		client:          cfg.Client,
 		resolver:        resolver,
 		ownerID:         cfg.OwnerID,
 		ownershipStrict: cfg.OwnershipStrict,
+		dryRun:          cfg.DryRun,
 		domainFilter:    endpoint.NewDomainFilter(cfg.DomainFilter),
 		metrics:         cfg.Metrics,
+		log:             logger,
 	}, nil
 }
 
@@ -197,6 +221,11 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 
 // ApplyChanges creates/deletes hostname routes to satisfy the plan. Updates are no-ops: a
 // route is just a hostname->tunnel binding with no mutable attributes this provider manages.
+//
+// In dry-run mode the gate sits at each mutating call rather than at the top of the function.
+// That is deliberate: the domain filter, tunnel resolution, ownership filtering and the
+// hostname->route-id lookup all still run, so the logged plan reflects what would really happen
+// and misconfiguration (e.g. a hostname with no configured tunnel) still fails loudly.
 func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
 	if changes == nil || (len(changes.Create) == 0 && len(changes.Delete) == 0) {
 		return nil
@@ -234,6 +263,12 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		if !ok {
 			return fmt.Errorf("no tunnel configured for hostname %q", ep.DNSName)
 		}
+		if p.dryRun {
+			p.log.Info("dry run: would CREATE hostname route",
+				"hostname", ep.DNSName, "tunnel_id", tid, "comment", p.comment())
+			p.metrics.DryRunSkipped(metrics.OpCreate)
+			continue
+		}
 		_, err := p.client.CreateHostnameRoute(ctx, ep.DNSName, tid, p.comment())
 		p.metrics.APIRequest(metrics.OpCreate, err)
 		if err != nil {
@@ -249,6 +284,11 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		id, ok := byHost[strings.ToLower(ep.DNSName)]
 		if !ok {
 			continue // already gone, or not owned by us in strict mode
+		}
+		if p.dryRun {
+			p.log.Info("dry run: would DELETE hostname route", "hostname", ep.DNSName, "route_id", id)
+			p.metrics.DryRunSkipped(metrics.OpDelete)
+			continue
 		}
 		err := p.client.DeleteHostnameRoute(ctx, id)
 		p.metrics.APIRequest(metrics.OpDelete, err)

@@ -15,13 +15,18 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
 
 	"github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/cloudflare"
+	"github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/metrics"
 )
 
 const testTunnel = "f70ff985-a4ef-4643-bbbc-4a0ed4fc8415"
@@ -267,6 +272,196 @@ func TestMultiTunnel_RecordsUsesPerTunnelTarget(t *testing.T) {
 func TestNew_RequiresTunnel(t *testing.T) {
 	if _, err := New(Config{Client: &fakeAPI{}}); err == nil {
 		t.Fatal("expected error when neither TunnelID nor TunnelMap is set")
+	}
+}
+
+// --- dry run (infra-415m.12) ---------------------------------------------------------------
+//
+// ExternalDNS's own --dry-run never reaches a webhook provider, so DRY_RUN here is the only
+// thing standing between a reconcile and a live Cloudflare account. These tests assert on the
+// EXPORTED metric series, because that is what an operator alerts on.
+
+// dryRunHarness builds a provider wired to a fresh registry and a capturing logger.
+func dryRunHarness(t *testing.T, api routeAPI, dryRun bool) (*Provider, *prometheus.Registry, *bytes.Buffer) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client:          api,
+		TunnelID:        testTunnel,
+		OwnerID:         "test",
+		OwnershipStrict: true,
+		DryRun:          dryRun,
+		DomainFilter:    []string{"private"},
+		Metrics:         m,
+		Logger:          slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p, reg, &logs
+}
+
+// metricValue reads one sample from a gathered registry by family name and exact label set.
+// The metrics package keeps its collectors unexported, so we go through the registry rather
+// than testutil.ToFloat64. A series that was never touched reports 0.
+func metricValue(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			got := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				got[lp.GetName()] = lp.GetValue()
+			}
+			if len(got) != len(labels) {
+				continue
+			}
+			match := true
+			for k, v := range labels {
+				if got[k] != v {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			switch {
+			case m.Counter != nil:
+				return m.Counter.GetValue()
+			case m.Gauge != nil:
+				return m.Gauge.GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// dryRunAPI holds one pre-existing route owned by us, so the delete path has something to find.
+func dryRunAPI() *fakeAPI {
+	return &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-old.private", Hostname: "old.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+}
+
+// dryRunPlan would create one route and delete the pre-existing one.
+func dryRunPlan(p *Provider) *plan.Changes {
+	target := p.resolver.target(testTunnel)
+	return &plan.Changes{
+		Create: []*endpoint.Endpoint{endpoint.NewEndpoint("new.private", endpoint.RecordTypeCNAME, target)},
+		Delete: []*endpoint.Endpoint{endpoint.NewEndpoint("old.private", endpoint.RecordTypeCNAME, target)},
+	}
+}
+
+func TestApplyChanges_DryRunMakesZeroMutatingCalls(t *testing.T) {
+	api := dryRunAPI()
+	p, reg, logs := dryRunHarness(t, api, true)
+	changes := dryRunPlan(p)
+
+	if err := p.ApplyChanges(context.Background(), changes); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+
+	// The whole point: nothing mutated.
+	if len(api.created) != 0 || len(api.deleted) != 0 {
+		t.Fatalf("dry run mutated Cloudflare: created=%v deleted=%v", api.created, api.deleted)
+	}
+	for _, op := range []string{metrics.OpCreate, metrics.OpDelete} {
+		for _, result := range []string{"success", "error"} {
+			labels := map[string]string{"operation": op, "result": result}
+			if got := metricValue(t, reg, "cfzt_provider_api_requests_total", labels); got != 0 {
+				t.Errorf("api_requests_total{%s,%s} = %v, want 0 in dry run", op, result, got)
+			}
+		}
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_created_total", nil); got != 0 {
+		t.Errorf("routes_created_total = %v, want 0", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_deleted_total", nil); got != 0 {
+		t.Errorf("routes_deleted_total = %v, want 0", got)
+	}
+
+	// Read-only listing MUST still happen, otherwise the logged plan would be guesswork rather
+	// than a diff against live state.
+	listLabels := map[string]string{"operation": metrics.OpList, "result": "success"}
+	if got := metricValue(t, reg, "cfzt_provider_api_requests_total", listLabels); got != 1 {
+		t.Errorf("api_requests_total{list,success} = %v, want 1 (dry run still reads live state)", got)
+	}
+
+	// Observability: the gauge says "inert", the counters say "actively declining work".
+	if got := metricValue(t, reg, "cfzt_provider_dry_run", nil); got != 1 {
+		t.Errorf("dry_run gauge = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": metrics.OpCreate}); got != 1 {
+		t.Errorf("dry_run_skipped_total{create} = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": metrics.OpDelete}); got != 1 {
+		t.Errorf("dry_run_skipped_total{delete} = %v, want 1", got)
+	}
+
+	// And the intended changes are actually reported, including the route id we would delete.
+	out := logs.String()
+	for _, want := range []string{"would CREATE", "new.private", "would DELETE", "old.private", "id-old.private"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry-run log missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestApplyChanges_DryRunOffStillMutates(t *testing.T) {
+	api := dryRunAPI()
+	p, reg, _ := dryRunHarness(t, api, false)
+	changes := dryRunPlan(p)
+
+	if err := p.ApplyChanges(context.Background(), changes); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.created) != 1 || api.created[0] != "new.private" {
+		t.Errorf("created = %v, want [new.private] when DryRun is off", api.created)
+	}
+	if len(api.deleted) != 1 || api.deleted[0] != "id-old.private" {
+		t.Errorf("deleted = %v, want [id-old.private] when DryRun is off", api.deleted)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run", nil); got != 0 {
+		t.Errorf("dry_run gauge = %v, want 0", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": metrics.OpCreate}); got != 0 {
+		t.Errorf("dry_run_skipped_total{create} = %v, want 0", got)
+	}
+}
+
+// Dry run is a validation pass, not a bypass: a hostname with no configured tunnel must still
+// fail loudly rather than be silently reported as fine.
+func TestApplyChanges_DryRunStillValidatesTunnelSelection(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	p, err := New(Config{
+		Client:       &fakeAPI{},
+		TunnelMap:    map[string]string{"apps.private": testTunnel},
+		OwnerID:      "test",
+		DryRun:       true,
+		DomainFilter: []string{"private"},
+		Metrics:      m,
+		Logger:       slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	changes := &plan.Changes{Create: []*endpoint.Endpoint{
+		endpoint.NewEndpoint("orphan.private", endpoint.RecordTypeCNAME, ""), // matches no mapped domain
+	}}
+	if err := p.ApplyChanges(context.Background(), changes); err == nil {
+		t.Fatal("dry run should still reject a hostname with no configured tunnel")
 	}
 }
 

@@ -51,6 +51,7 @@ func main() {
 
 	ownerID := envOr("OWNER_ID", "default")
 	ownershipStrict := envBool("OWNERSHIP_STRICT", true)
+	dryRun := envBool("DRY_RUN", false)
 	domainFilter := splitCSV(os.Getenv("DOMAIN_FILTER"))
 	webhookListen := envOr("WEBHOOK_LISTEN", "127.0.0.1:8888")
 	healthListen := envOr("HEALTH_LISTEN", "0.0.0.0:8080")
@@ -66,8 +67,10 @@ func main() {
 		TunnelMap:       tunnelMap,
 		OwnerID:         ownerID,
 		OwnershipStrict: ownershipStrict,
+		DryRun:          dryRun,
 		DomainFilter:    domainFilter,
 		Metrics:         m,
+		Logger:          log,
 	})
 	if err != nil {
 		log.Error("configuration error", "err", err)
@@ -79,7 +82,13 @@ func main() {
 	log.Info("starting webhook provider",
 		"webhook", webhookListen, "health", healthListen,
 		"tunnel_id", tunnelID, "tunnel_map", tunnelMap, "account_id", accountID,
-		"owner_id", ownerID, "ownership_strict", ownershipStrict, "domain_filter", domainFilter)
+		"owner_id", ownerID, "ownership_strict", ownershipStrict, "dry_run", dryRun,
+		"domain_filter", domainFilter)
+
+	if dryRun {
+		log.Warn("DRY_RUN=true: NO Cloudflare route will be created or deleted; " +
+			"intended changes are logged only. Unset DRY_RUN to apply changes.")
+	}
 
 	// Blocks. Serves GET /, GET /records, POST /records, POST /adjustendpoints.
 	api.StartHTTPApi(p, nil, 5*time.Second, 10*time.Second, webhookListen)
