@@ -40,6 +40,36 @@ rules:
     resources: ["ingresses"]
     verbs: ["get", "watch", "list"]
 ---
+# Leg 2 (optional, enabled by COREDNS_CONFIGMAP): permission to write ONE key of ONE ConfigMap.
+# Scoped with resourceNames so this cannot touch the base Corefile ConfigMap or any other. `patch`
+# is what server-side apply needs; `get` is the read half of the read-modify-write. NOT `update`,
+# and no `create` — the fragment ConfigMap is expected to already exist, owned by whoever manages
+# the cluster's CoreDNS.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: external-dns-coredns-fragment
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["coredns-fragments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: external-dns-coredns-fragment
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: external-dns-coredns-fragment
+subjects:
+  - kind: ServiceAccount
+    name: external-dns
+    namespace: external-dns
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -144,6 +174,24 @@ spec:
             #     deliberately for a migration, ideally with DRY_RUN=true first.
             - name: ADOPT_UNTAGGED
               value: "false"
+            # --- Leg 2: the in-cluster CoreDNS answer (optional) ---
+            # Unset, this provider manages ONLY the Cloudflare route, and a name will NOT resolve
+            # until something else supplies the CoreDNS answer. Set COREDNS_CONFIGMAP to
+            # <namespace>/<name> and this instance also owns one key of that ConfigMap, so a single
+            # Service annotation drives BOTH legs.
+            #
+            # Requires: the cluster's CoreDNS Corefile must `import` the fragment directory (e.g.
+            # `import /etc/coredns-custom/*.override`) with that ConfigMap mounted there, and the
+            # RBAC Role above. The provider writes ONLY its own key under its own field manager, so
+            # it can never disturb another owner's key or the base Corefile.
+            # - name: COREDNS_CONFIGMAP
+            #   value: "kube-system/coredns-fragments"
+            # - name: COREDNS_FRAGMENT_KEY      # default zz-external-dns.override
+            #   value: "zz-external-dns.override"
+            # - name: COREDNS_FIELD_MANAGER     # default external-dns; MUST be unique to this writer
+            #   value: "external-dns"
+            # - name: CLUSTER_DOMAIN            # default cluster.local
+            #   value: "cluster.local"
             # Single tunnel via CF_TUNNEL_ID (from the secret below). For multiple tunnels,
             # drop CF_TUNNEL_ID and set TUNNEL_MAP instead (most-specific domain wins):
             #   - name: TUNNEL_MAP
