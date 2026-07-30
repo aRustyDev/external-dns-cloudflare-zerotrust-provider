@@ -5,6 +5,10 @@
 # NOTE: this only manages the Cloudflare route half. The in-cluster CoreDNS answer
 # (foo.private -> foo.<ns>.svc.cluster.local, so cloudflared can forward to the ClusterIP)
 # is a SEPARATE concern — a CoreDNS fragment / etcd source — and is not managed here.
+#
+# ⚠️  This Service is type ClusterIP, so ExternalDNS needs --publish-internal-services (set in
+#     deploy/deployment.yaml). Without that flag it skips ClusterIP Services silently: no route
+#     is created and nothing is logged as an error.
 apiVersion: v1
 kind: Service
 metadata:

@@ -6,7 +6,13 @@
 #     --from-literal=CF_ACCOUNT_ID=<account-id> \
 #     --from-literal=CF_TUNNEL_ID=<tunnel-id>
 #
-# The scoped API token needs: Account > Cloudflare Tunnel : Edit (Zero Trust routes).
+# The scoped API token needs: Account > Cloudflare One Networks : Edit.
+# (Cloudflare Tunnel : Edit alone is NOT sufficient — route creation returns 403 error 10000.)
+#
+# ⚠️  ExternalDNS's --dry-run DOES NOT PROTECT A WEBHOOK PROVIDER. It logs "No changes to DNS
+#     records will be made." and then makes them: cfg.DryRun is never passed to the webhook
+#     provider (see docs/upstream-dry-run-gap.md). To rehearse safely against a live Cloudflare
+#     account, set DRY_RUN=true on the webhook container below — NOT --dry-run here.
 ---
 apiVersion: v1
 kind: Namespace
@@ -88,8 +94,14 @@ spec:
             # mode so deletes are confined to routes this instance owns).
             - --policy=upsert-only
             - --domain-filter=private
+            # REQUIRED for ClusterIP Services (which example-service.yaml is, and which most
+            # `.private` names front). Without it ExternalDNS silently skips them — no route,
+            # no error.
+            - --publish-internal-services
             - --interval=1m
             - --log-level=info
+            # NOTE: do NOT add --dry-run expecting it to protect anything. It is silently inert
+            # for webhook providers; set DRY_RUN=true on the webhook container instead.
           ports:
             - name: http
               containerPort: 7979
@@ -117,6 +129,12 @@ spec:
             # recommended; set "false" only to deliberately adopt pre-existing routes.
             - name: OWNERSHIP_STRICT
               value: "true"
+            # DRY_RUN=true logs every intended route create/delete and makes NO mutating
+            # Cloudflare call — the only working dry run for a webhook provider. Read-only list
+            # calls still happen, so the logged plan is a real diff against live state.
+            # Alert on cfzt_provider_dry_run == 1 so an instance is never left inert unnoticed.
+            - name: DRY_RUN
+              value: "false"
             # Single tunnel via CF_TUNNEL_ID (from the secret below). For multiple tunnels,
             # drop CF_TUNNEL_ID and set TUNNEL_MAP instead (most-specific domain wins):
             #   - name: TUNNEL_MAP

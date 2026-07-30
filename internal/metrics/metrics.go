@@ -40,6 +40,8 @@ type Metrics struct {
 	routesDeleted  prometheus.Counter
 	applyDuration  prometheus.Histogram
 	recordsManaged prometheus.Gauge
+	dryRun         prometheus.Gauge
+	dryRunSkipped  *prometheus.CounterVec
 }
 
 // New builds the collectors (unregistered). Call MustRegister to attach them to a registry.
@@ -66,6 +68,14 @@ func New() *Metrics {
 			Namespace: namespace, Subsystem: subsystem, Name: "records_managed",
 			Help: "Managed hostname routes observed on the most recent Records() call.",
 		}),
+		dryRun: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "dry_run",
+			Help: "1 when the provider suppresses all mutating Cloudflare calls (DRY_RUN), else 0.",
+		}),
+		dryRunSkipped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "dry_run_skipped_total",
+			Help: "Mutating Cloudflare calls suppressed by dry-run mode, by operation.",
+		}, []string{"operation"}),
 	}
 }
 
@@ -77,6 +87,8 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.routesDeleted,
 		m.applyDuration,
 		m.recordsManaged,
+		m.dryRun,
+		m.dryRunSkipped,
 	)
 }
 
@@ -122,4 +134,28 @@ func (m *Metrics) SetRecordsManaged(n int) {
 		return
 	}
 	m.recordsManaged.Set(float64(n))
+}
+
+// SetDryRun publishes whether the provider is suppressing mutations. It is exported as a gauge
+// so a long-running instance cannot be silently inert in the *other* direction: alert on
+// cfzt_provider_dry_run == 1 to catch a deployment left in dry-run by accident.
+func (m *Metrics) SetDryRun(on bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if on {
+		v = 1
+	}
+	m.dryRun.Set(v)
+}
+
+// DryRunSkipped records one mutating call suppressed by dry-run mode. A rising value means the
+// instance is actively being asked to change routes and declining — which is what makes the
+// dry_run gauge actionable rather than merely informational.
+func (m *Metrics) DryRunSkipped(operation string) {
+	if m == nil {
+		return
+	}
+	m.dryRunSkipped.WithLabelValues(operation).Inc()
 }

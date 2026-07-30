@@ -33,6 +33,8 @@ func TestMetrics_RegisterAndCount(t *testing.T) {
 	m.RouteCreated()
 	m.RouteDeleted()
 	m.SetRecordsManaged(7)
+	m.SetDryRun(true)
+	m.DryRunSkipped(OpCreate)
 
 	if got := testutil.ToFloat64(m.routesCreated); got != 2 {
 		t.Errorf("routes_created_total = %v, want 2", got)
@@ -49,6 +51,18 @@ func TestMetrics_RegisterAndCount(t *testing.T) {
 	if got := testutil.ToFloat64(m.apiRequests.WithLabelValues(OpCreate, "error")); got != 1 {
 		t.Errorf("api_requests_total{create,error} = %v, want 1", got)
 	}
+	if got := testutil.ToFloat64(m.dryRun); got != 1 {
+		t.Errorf("dry_run = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.dryRunSkipped.WithLabelValues(OpCreate)); got != 1 {
+		t.Errorf("dry_run_skipped_total{create} = %v, want 1", got)
+	}
+
+	// The gauge must be able to go back down, otherwise it cannot clear an alert.
+	m.SetDryRun(false)
+	if got := testutil.ToFloat64(m.dryRun); got != 0 {
+		t.Errorf("dry_run after SetDryRun(false) = %v, want 0", got)
+	}
 }
 
 func TestMetrics_NilIsNoop(t *testing.T) {
@@ -59,4 +73,6 @@ func TestMetrics_NilIsNoop(t *testing.T) {
 	m.RouteDeleted()
 	m.ObserveApply(0.5)
 	m.SetRecordsManaged(3)
+	m.SetDryRun(true)
+	m.DryRunSkipped(OpCreate)
 }

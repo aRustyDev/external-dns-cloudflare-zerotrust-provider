@@ -11,6 +11,12 @@ resolve-through-tunnel path — and removes it when the Service goes away.
 > **Status: alpha.** Interfaces and defaults may change. Validate with `--policy=upsert-only`
 > before enabling deletes.
 
+> [!WARNING]
+> **ExternalDNS's `--dry-run` does NOT protect a webhook provider.** It logs `running in
+> dry-run mode. No changes to DNS records will be made.` and then makes them — `cfg.DryRun`
+> never reaches a webhook provider. Use this provider's own **`DRY_RUN=true`** instead. See
+> [Dry run](#dry-run).
+
 ## Scope — read this first
 
 A `<name>.private` name needs **two** independent things to resolve over WARP:
@@ -39,7 +45,8 @@ plan diffs; `ApplyChanges` translates Create/Delete into hostname-route CRUD on 
 ## Install
 
 ```sh
-# 1) Credentials (scoped API token: Account > Cloudflare Tunnel : Edit)
+# 1) Credentials. Scoped API token needs Account > Cloudflare One Networks : Edit.
+#    (Cloudflare Tunnel : Edit alone is NOT enough — route creation 403s with error 10000.)
 kubectl create namespace external-dns
 kubectl -n external-dns create secret generic cf-zerotrust \
   --from-literal=CF_API_TOKEN=<scoped-token> \
@@ -62,6 +69,7 @@ kubectl apply -f deploy/deployment.yaml
 | `TUNNEL_MAP` | conditional | — | Multi-tunnel mode: `domain=tunnelID,...` (most-specific domain wins). Supersedes `CF_TUNNEL_ID` |
 | `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`) |
 | `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
+| `DRY_RUN` | no | `false` | Log intended route creates/deletes and make **no** mutating Cloudflare call (see [Dry run](#dry-run)) |
 | `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `private`) |
 | `WEBHOOK_LISTEN` | no | `127.0.0.1:8888` | Webhook API listen address (localhost-only by design) |
 | `HEALTH_LISTEN` | no | `0.0.0.0:8080` | Health (`/healthz`, `/readyz`) **and** Prometheus `/metrics` |
@@ -71,6 +79,36 @@ kubectl apply -f deploy/deployment.yaml
 - `--provider=webhook` and (implicitly) `--webhook-provider-url=http://localhost:8888`.
 - `--registry=noop` — **required**: Zero Trust routes can't store TXT ownership records.
 - `--policy=sync` to allow deletes; `--policy=upsert-only` while validating.
+- `--publish-internal-services` — **required for `ClusterIP` Services.** Without it ExternalDNS
+  silently skips them, and you get no route and no error. Most `.private` names front a
+  ClusterIP Service, so you almost certainly need this.
+- `--dry-run` — **does nothing here.** Use `DRY_RUN=true` on the webhook instead.
+
+## Dry run
+
+Set **`DRY_RUN=true`** on the webhook container to make `ApplyChanges` log every intended
+create/delete and return without issuing a single mutating Cloudflare call. Read-only `list`
+calls still happen, so the logged plan is a real diff against live state rather than a guess,
+and misconfiguration (a hostname with no configured tunnel) still fails loudly.
+
+```
+level=INFO msg="dry run: would CREATE hostname route" hostname=foo.private tunnel_id=… comment=managed-by=external-dns/cluster-a
+level=INFO msg="dry run: would DELETE hostname route" hostname=old.private route_id=…
+```
+
+Two metrics keep a dry-run deployment honest in **both** directions — the risk is not only
+"I thought it was inert and it wasn't", but also "it has been inert for a month and nobody
+noticed":
+
+- `cfzt_provider_dry_run` — gauge, `1` while suppressing. Alert on it being `1` unexpectedly.
+- `cfzt_provider_dry_run_skipped_total{operation}` — counter of suppressed mutations. Rising
+  means this instance is being asked to change routes and declining, which is what makes the
+  gauge actionable.
+
+> **Why this exists.** ExternalDNS implements dry-run *per provider*, and the webhook path never
+> receives `cfg.DryRun` — so `--dry-run` is silently inert for every webhook provider, not just
+> this one. Full source citations, and a ready-to-file upstream issue draft, are in
+> [`docs/upstream-dry-run-gap.md`](docs/upstream-dry-run-gap.md).
 
 ## Ownership
 
@@ -108,6 +146,8 @@ Prometheus metrics are exposed on the health port at `/metrics` (the sample mani
 | `cfzt_provider_routes_deleted_total` | counter | — | Hostname routes deleted |
 | `cfzt_provider_apply_duration_seconds` | histogram | — | `ApplyChanges` reconcile duration |
 | `cfzt_provider_records_managed` | gauge | — | Managed routes seen on the last `Records()` |
+| `cfzt_provider_dry_run` | gauge | — | `1` while `DRY_RUN` suppresses all mutations, else `0` |
+| `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`) | Mutations suppressed by dry run |
 
 ## Development
 
