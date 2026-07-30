@@ -17,6 +17,7 @@ package cloudflare
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -103,6 +104,70 @@ func TestDeleteHostnameRoute(t *testing.T) {
 	}
 	if !strings.HasSuffix(gotPath, "/zerotrust/routes/hostname/route-1") {
 		t.Errorf("path = %s", gotPath)
+	}
+}
+
+// PatchHostnameRouteComment must send ONLY the comment. Sending hostname/tunnel_id would work
+// against the live API too, but it would make an accidental tunnel retarget expressible — the
+// one thing adoption must never do.
+func TestPatchHostnameRouteComment_SendsOnlyComment(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		_, _ = w.Write([]byte(`{"success":true,"result":{"id":"route-1","hostname":"foo.private","tunnel_id":"tun-1","comment":"managed-by=external-dns/x"}}`))
+	}))
+	defer srv.Close()
+
+	c := New(acct, "tok", WithBaseURL(srv.URL))
+	route, err := c.PatchHostnameRouteComment(context.Background(), "route-1", "managed-by=external-dns/x")
+	if err != nil {
+		t.Fatalf("PatchHostnameRouteComment: %v", err)
+	}
+	if gotMethod != http.MethodPatch {
+		t.Errorf("method = %s, want PATCH", gotMethod)
+	}
+	if !strings.HasSuffix(gotPath, "/zerotrust/routes/hostname/route-1") {
+		t.Errorf("path = %s", gotPath)
+	}
+	if len(gotBody) != 1 || gotBody["comment"] != "managed-by=external-dns/x" {
+		t.Errorf("body = %v, want exactly {comment}", gotBody)
+	}
+	// Route identity must come back unchanged — this is what makes adoption zero-downtime.
+	if route.ID != "route-1" || route.TunnelID != "tun-1" || route.Hostname != "foo.private" {
+		t.Errorf("route identity changed: %+v", route)
+	}
+}
+
+// A duplicate hostname is rejected with 409 / 1108 by the live API. Callers act on the CODE, not
+// the message text (whose "another tunnel" wording is wrong for same-tunnel duplicates).
+func TestHasCode_DetectsHostnameAlreadyRouted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":1108,"message":"Hostname Route already routed to another tunnel"}]}`))
+	}))
+	defer srv.Close()
+
+	c := New(acct, "tok", WithBaseURL(srv.URL))
+	_, err := c.CreateHostnameRoute(context.Background(), "dup.private", "tun-1", "")
+	if err == nil {
+		t.Fatal("want an error for a duplicate hostname")
+	}
+	if !HasCode(err, ErrCodeHostnameAlreadyRouted) {
+		t.Errorf("HasCode(err, %d) = false, want true (err = %v)", ErrCodeHostnameAlreadyRouted, err)
+	}
+	if HasCode(err, 10000) {
+		t.Error("HasCode matched a code the response did not carry")
+	}
+	if HasCode(errors.New("plain error"), ErrCodeHostnameAlreadyRouted) {
+		t.Error("HasCode must be false for a non-API error")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
+		t.Errorf("want an *APIError carrying status 409, got %#v", err)
 	}
 }
 

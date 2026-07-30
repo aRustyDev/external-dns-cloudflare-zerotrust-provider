@@ -31,6 +31,7 @@ const (
 	OpList   = "list"
 	OpCreate = "create"
 	OpDelete = "delete"
+	OpPatch  = "patch"
 )
 
 // Metrics holds the provider's Prometheus collectors.
@@ -38,6 +39,7 @@ type Metrics struct {
 	apiRequests    *prometheus.CounterVec
 	routesCreated  prometheus.Counter
 	routesDeleted  prometheus.Counter
+	routesAdopted  prometheus.Counter
 	applyDuration  prometheus.Histogram
 	recordsManaged prometheus.Gauge
 	dryRun         prometheus.Gauge
@@ -58,6 +60,10 @@ func New() *Metrics {
 		routesDeleted: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace, Subsystem: subsystem, Name: "routes_deleted_total",
 			Help: "Hostname routes deleted by this provider.",
+		}),
+		routesAdopted: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "routes_adopted_total",
+			Help: "Pre-existing hostname routes claimed in place by comment PATCH (no delete/recreate).",
 		}),
 		applyDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: subsystem, Name: "apply_duration_seconds",
@@ -85,6 +91,7 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.apiRequests,
 		m.routesCreated,
 		m.routesDeleted,
+		m.routesAdopted,
 		m.applyDuration,
 		m.recordsManaged,
 		m.dryRun,
@@ -118,6 +125,15 @@ func (m *Metrics) RouteDeleted() {
 		return
 	}
 	m.routesDeleted.Inc()
+}
+
+// RouteAdopted increments the adopted-routes counter. Adoption rewrites an existing route's
+// comment in place, so this is deliberately NOT counted as a create.
+func (m *Metrics) RouteAdopted() {
+	if m == nil {
+		return
+	}
+	m.routesAdopted.Inc()
 }
 
 // ObserveApply records the duration of one ApplyChanges call, in seconds.

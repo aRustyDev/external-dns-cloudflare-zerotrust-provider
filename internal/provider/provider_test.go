@@ -17,6 +17,8 @@ package provider
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -39,6 +41,10 @@ type fakeAPI struct {
 	created        []string
 	createdTunnels []string
 	deleted        []string
+	patched        []string // route ids patched, in order
+	patchComments  []string
+	patchErr       error
+	createErr      error
 	nextID         int
 }
 
@@ -56,12 +62,33 @@ func (f *fakeAPI) ListHostnameRoutes(_ context.Context, tunnelID string) ([]clou
 }
 
 func (f *fakeAPI) CreateHostnameRoute(_ context.Context, hostname, tunnelID, comment string) (*cloudflare.HostnameRoute, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
 	f.nextID++
 	r := cloudflare.HostnameRoute{ID: "id-" + hostname, Hostname: hostname, TunnelID: tunnelID, Comment: comment}
 	f.routes = append(f.routes, r)
 	f.created = append(f.created, hostname)
 	f.createdTunnels = append(f.createdTunnels, tunnelID)
 	return &r, nil
+}
+
+// PatchHostnameRouteComment mirrors the live API: it rewrites the comment IN PLACE, keeping the
+// route id, hostname and tunnel binding — the property that makes adoption zero-downtime.
+func (f *fakeAPI) PatchHostnameRouteComment(_ context.Context, id, comment string) (*cloudflare.HostnameRoute, error) {
+	if f.patchErr != nil {
+		return nil, f.patchErr
+	}
+	f.patched = append(f.patched, id)
+	f.patchComments = append(f.patchComments, comment)
+	for i := range f.routes {
+		if f.routes[i].ID == id {
+			f.routes[i].Comment = comment
+			r := f.routes[i]
+			return &r, nil
+		}
+	}
+	return nil, fmt.Errorf("no such route %q", id)
 }
 
 func (f *fakeAPI) DeleteHostnameRoute(_ context.Context, id string) error {
@@ -462,6 +489,218 @@ func TestApplyChanges_DryRunStillValidatesTunnelSelection(t *testing.T) {
 	}}
 	if err := p.ApplyChanges(context.Background(), changes); err == nil {
 		t.Fatal("dry run should still reject a hostname with no configured tunnel")
+	}
+}
+
+// --- route adoption (infra-415m.8) ---------------------------------------------------------
+//
+// Cloudflare REJECTS a duplicate hostname route (409 / error 1108, live-verified), so a create
+// for an already-routed hostname cannot succeed. Adoption claims the existing route by comment
+// PATCH instead, keeping the route id and tunnel binding so DNS never stops resolving.
+
+// adoptHarness builds an adoption-enabled provider over api, plus its registry and log buffer.
+func adoptHarness(t *testing.T, api routeAPI, adopt bool) (*Provider, *prometheus.Registry, *bytes.Buffer) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client:          api,
+		TunnelID:        testTunnel,
+		OwnerID:         "test",
+		OwnershipStrict: true,
+		AdoptUntagged:   adopt,
+		DomainFilter:    []string{"private"},
+		Metrics:         m,
+		Logger:          slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p, reg, &logs
+}
+
+func createPlan(p *Provider, host string) *plan.Changes {
+	return &plan.Changes{Create: []*endpoint.Endpoint{
+		endpoint.NewEndpoint(host, endpoint.RecordTypeCNAME, p.resolver.target(testTunnel)),
+	}}
+}
+
+// The headline property: adoption is an in-place comment rewrite, NOT a delete/recreate.
+func TestAdopt_ClaimsUntaggedRouteInPlace(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "tf-route-id", Hostname: "legacy.private", TunnelID: testTunnel, Comment: "managed by opentofu"},
+	}}
+	p, reg, logs := adoptHarness(t, api, true)
+
+	if err := p.ApplyChanges(context.Background(), createPlan(p, "legacy.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+
+	if len(api.patched) != 1 || api.patched[0] != "tf-route-id" {
+		t.Fatalf("patched = %v, want [tf-route-id]", api.patched)
+	}
+	if got := api.patchComments[0]; got != "managed-by=external-dns/test" {
+		t.Errorf("new comment = %q, want this owner's tag", got)
+	}
+	// No delete, no create — that is what "zero DNS interruption" means here.
+	if len(api.created) != 0 || len(api.deleted) != 0 {
+		t.Errorf("adoption must not create or delete: created=%v deleted=%v", api.created, api.deleted)
+	}
+	// The route id is unchanged, so the hostname->tunnel binding never lapsed.
+	if api.routes[0].ID != "tf-route-id" || api.routes[0].TunnelID != testTunnel {
+		t.Errorf("route identity changed: %+v", api.routes[0])
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_adopted_total", nil); got != 1 {
+		t.Errorf("routes_adopted_total = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_created_total", nil); got != 0 {
+		t.Errorf("routes_created_total = %v, want 0 (adoption is not a create)", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_api_requests_total", map[string]string{"operation": "patch", "result": "success"}); got != 1 {
+		t.Errorf("api_requests_total{patch,success} = %v, want 1", got)
+	}
+	// The overwritten comment is the only record of the previous claim, so it must be logged.
+	if out := logs.String(); !strings.Contains(out, "managed by opentofu") {
+		t.Errorf("adoption log must record the old comment; got:\n%s", out)
+	}
+}
+
+func TestAdopt_DisabledByDefaultStillCreates(t *testing.T) {
+	api := &fakeAPI{}
+	p, _, _ := adoptHarness(t, api, false)
+
+	if err := p.ApplyChanges(context.Background(), createPlan(p, "fresh.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.patched) != 0 {
+		t.Errorf("nothing should be patched when adoption is off: %v", api.patched)
+	}
+	if len(api.created) != 1 {
+		t.Errorf("created = %v, want the normal create path", api.created)
+	}
+}
+
+// With adoption OFF, an existing route is not even looked at — the create runs and Cloudflare
+// 409s. Assert the error carries the actionable hint rather than the raw vendor message.
+func TestAdopt_OffSurfacesAlreadyRoutedHint(t *testing.T) {
+	api := &fakeAPI{createErr: &cloudflare.APIError{
+		Method: "POST", StatusCode: 409,
+		Codes:   []int{cloudflare.ErrCodeHostnameAlreadyRouted},
+		Message: "[1108] Hostname Route already routed to another tunnel",
+	}}
+	p, _, _ := adoptHarness(t, api, false)
+
+	err := p.ApplyChanges(context.Background(), createPlan(p, "legacy.private"))
+	if err == nil {
+		t.Fatal("want an error when Cloudflare rejects the duplicate")
+	}
+	if !strings.Contains(err.Error(), "ADOPT_UNTAGGED=true") {
+		t.Errorf("error should point at the fix; got: %v", err)
+	}
+	var apiErr *cloudflare.APIError
+	if !errors.As(err, &apiErr) {
+		t.Errorf("error should still wrap the APIError for code inspection; got %T", err)
+	}
+}
+
+func TestAdopt_RefusesRouteOnDifferentTunnel(t *testing.T) {
+	const otherTunnel = "99999999-9999-9999-9999-999999999999"
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "elsewhere", Hostname: "legacy.private", TunnelID: otherTunnel, Comment: "untagged"},
+	}}
+	p, _, _ := adoptHarness(t, api, true)
+
+	// The guard is exercised directly rather than through ApplyChanges: in single-tunnel mode a
+	// route on another tunnel is never listed, so it cannot reach adopt(). The reachable path is
+	// multi-tunnel mode, where several tunnels are listed and a hostname can resolve to one
+	// tunnel while its existing route sits on another. That is the collision this refuses.
+	err := p.adopt(context.Background(), api.routes[0], testTunnel)
+	if err == nil {
+		t.Fatal("want refusal: the route is bound to a different tunnel")
+	}
+	if !strings.Contains(err.Error(), otherTunnel) {
+		t.Errorf("error should name the conflicting tunnel; got: %v", err)
+	}
+	if len(api.patched) != 0 {
+		t.Errorf("must not patch a route on another tunnel: %v", api.patched)
+	}
+}
+
+func TestAdopt_RefusesRouteOwnedByAnotherExternalDNS(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "theirs", Hostname: "legacy.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/other-cluster"},
+	}}
+	p, _, _ := adoptHarness(t, api, true)
+
+	err := p.ApplyChanges(context.Background(), createPlan(p, "legacy.private"))
+	if err == nil {
+		t.Fatal("want refusal: the route belongs to a different external-dns owner")
+	}
+	if !strings.Contains(err.Error(), "other-cluster") {
+		t.Errorf("error should name the owner; got: %v", err)
+	}
+	if len(api.patched) != 0 {
+		t.Errorf("must not steal another owner's route: %v", api.patched)
+	}
+}
+
+// A route already carrying OUR tag needs no PATCH — adoption must be idempotent, not a
+// write-amplifier that re-stamps the same comment on every reconcile.
+func TestAdopt_AlreadyOursIsANoop(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "mine", Hostname: "legacy.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+	p, reg, _ := adoptHarness(t, api, true)
+
+	if err := p.ApplyChanges(context.Background(), createPlan(p, "legacy.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.patched) != 0 || len(api.created) != 0 {
+		t.Errorf("already-owned route needs no write: patched=%v created=%v", api.patched, api.created)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_adopted_total", nil); got != 0 {
+		t.Errorf("routes_adopted_total = %v, want 0 (nothing was newly claimed)", got)
+	}
+}
+
+// Adoption is a mutation, so DRY_RUN must suppress the PATCH too — otherwise the dry-run guard
+// would have a hole exactly where the migration does its riskiest work.
+func TestAdopt_DryRunSuppressesThePatch(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "tf-route-id", Hostname: "legacy.private", TunnelID: testTunnel, Comment: "managed by opentofu"},
+	}}
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client: api, TunnelID: testTunnel, OwnerID: "test", OwnershipStrict: true,
+		AdoptUntagged: true, DryRun: true, DomainFilter: []string{"private"},
+		Metrics: m, Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := p.ApplyChanges(context.Background(), createPlan(p, "legacy.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.patched) != 0 {
+		t.Fatalf("dry run must not PATCH: %v", api.patched)
+	}
+	if api.routes[0].Comment != "managed by opentofu" {
+		t.Errorf("dry run mutated the comment: %q", api.routes[0].Comment)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": "patch"}); got != 1 {
+		t.Errorf("dry_run_skipped_total{patch} = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_adopted_total", nil); got != 0 {
+		t.Errorf("routes_adopted_total = %v, want 0 in dry run", got)
+	}
+	if out := logs.String(); !strings.Contains(out, "would ADOPT") {
+		t.Errorf("dry run should report the intended adoption; got:\n%s", out)
 	}
 }
 

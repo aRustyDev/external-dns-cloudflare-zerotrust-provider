@@ -135,6 +135,15 @@ spec:
             # Alert on cfzt_provider_dry_run == 1 so an instance is never left inert unnoticed.
             - name: DRY_RUN
               value: "false"
+            # ADOPT_UNTAGGED=true lets a create for a hostname that ALREADY has a Cloudflare
+            # route claim that route instead of failing, by rewriting its comment to this
+            # OWNER_ID. The route id and tunnel binding are untouched, so the name never stops
+            # resolving — this is what makes a Terraform -> annotations migration zero-downtime
+            # (Cloudflare otherwise rejects the duplicate create with 409 / error 1108).
+            # ⚠️  It TAKES OWNERSHIP of routes this provider did not create. Enable it
+            #     deliberately for a migration, ideally with DRY_RUN=true first.
+            - name: ADOPT_UNTAGGED
+              value: "false"
             # Single tunnel via CF_TUNNEL_ID (from the secret below). For multiple tunnels,
             # drop CF_TUNNEL_ID and set TUNNEL_MAP instead (most-specific domain wins):
             #   - name: TUNNEL_MAP
