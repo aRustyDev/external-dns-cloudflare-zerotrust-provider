@@ -145,6 +145,34 @@ func TestAdjustEndpoints_Canonicalizes(t *testing.T) {
 	}
 }
 
+// The service source records which Service asked for a hostname in the "resource" label. That is
+// the only channel carrying it to ApplyChanges, and answering the name in-cluster needs it (a
+// CoreDNS rewrite is name->name, not name->IP), so canonicalization must not drop it.
+func TestAdjustEndpoints_PreservesResourceLabel(t *testing.T) {
+	p := newTestProvider(t, &fakeAPI{}, "private")
+	in := endpoint.NewEndpoint("foo.private", endpoint.RecordTypeA, "10.0.0.5")
+	in.Labels[endpoint.ResourceLabelKey] = "service/apps/foo-svc"
+
+	out, err := p.AdjustEndpoints([]*endpoint.Endpoint{in})
+	if err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("want 1 endpoint, got %d", len(out))
+	}
+	if got := out[0].Labels[endpoint.ResourceLabelKey]; got != "service/apps/foo-svc" {
+		t.Errorf("resource label = %q, want it carried through canonicalization", got)
+	}
+	// Canonicalization itself must still happen.
+	if out[0].RecordType != endpoint.RecordTypeCNAME {
+		t.Errorf("record type = %q, want CNAME", out[0].RecordType)
+	}
+	// The input must not be mutated — the plan still holds a reference to it.
+	if in.RecordType != endpoint.RecordTypeA {
+		t.Errorf("input endpoint was mutated: %+v", in)
+	}
+}
+
 func TestApplyChanges_CreateAndDelete(t *testing.T) {
 	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
 		{ID: "id-old.private", Hostname: "old.private", TunnelID: testTunnel},

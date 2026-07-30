@@ -207,6 +207,14 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 // AdjustEndpoints canonicalizes candidate endpoints so plan diffs are stable: everything we
 // manage becomes a CNAME to the target of the tunnel selected for its hostname. Hostnames
 // outside the domain filter, or with no matching tunnel, are dropped.
+//
+// Labels are carried across. endpoint.NewEndpoint does not copy them, and the ExternalDNS
+// service source's "resource" label (service/<namespace>/<name>) is the ONLY channel through
+// which ApplyChanges can learn which Service a hostname belongs to — needed to answer the name
+// in-cluster, because a CoreDNS rewrite maps name->name, not name->IP.
+//
+// This cannot cause perpetual updates: the plan compares targets and TTL (plan.targetChanged),
+// never labels; labels matter only to the TXT registry, which this provider cannot use.
 func (p *Provider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
 	var out []*endpoint.Endpoint
 	for _, ep := range endpoints {
@@ -217,7 +225,11 @@ func (p *Provider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.
 		if !ok {
 			continue // no tunnel configured for this hostname's domain
 		}
-		out = append(out, endpoint.NewEndpoint(ep.DNSName, recordType, target))
+		adjusted := endpoint.NewEndpoint(ep.DNSName, recordType, target)
+		for k, v := range ep.Labels {
+			adjusted.Labels[k] = v
+		}
+		out = append(out, adjusted)
 	}
 	return out, nil
 }
