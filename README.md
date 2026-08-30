@@ -187,6 +187,13 @@ CoreDNS reconfiguration.** The provider writes only its own key, under its own *
 it can never disturb another owner's key or the base `Corefile`. Give each writer a unique
 `COREDNS_FIELD_MANAGER`; sharing one is how keys get silently taken over.
 
+The server-side apply forces ownership of that one key. This is intentional: Kubernetes includes
+the write operation in managed-fields identity, so a key historically written by a client-side
+`Update` conflicts with a later `Apply` even when both use the same manager name. Forcing the first
+apply converts the key to `Apply` ownership; subsequent reconciles no longer need a takeover unless
+some other client performs another non-apply write. The apply payload contains only the configured
+fragment key, so this cannot claim another ConfigMap key or the base `Corefile`.
+
 RBAC is deliberately tiny — `get` + `patch` on that **one** ConfigMap by name (see
 `deploy/deployment.yaml`). No `create`, no `update`, no cluster-wide ConfigMap access.
 

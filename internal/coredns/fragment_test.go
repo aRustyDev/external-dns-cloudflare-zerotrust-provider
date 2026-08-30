@@ -16,6 +16,7 @@ package coredns
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -24,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	corev1apply "k8s.io/client-go/applyconfigurations/core/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 )
 
 // fakeCM is an in-memory ConfigMap. It records every Apply so tests can assert BOTH the rendered
@@ -35,6 +37,7 @@ type fakeCM struct {
 	applies   []map[string]string
 	applyErr  error
 	fieldMgrs []string
+	forces    []bool
 }
 
 func (f *fakeCM) Get(_ context.Context, name string, _ metav1.GetOptions) (*corev1.ConfigMap, error) {
@@ -50,6 +53,7 @@ func (f *fakeCM) Apply(_ context.Context, cm *corev1apply.ConfigMapApplyConfigur
 	}
 	f.applies = append(f.applies, cm.Data)
 	f.fieldMgrs = append(f.fieldMgrs, opts.FieldManager)
+	f.forces = append(f.forces, opts.Force)
 	if f.data == nil {
 		f.data = map[string]string{}
 	}
@@ -177,6 +181,125 @@ func TestApply_AddsAndRemoves(t *testing.T) {
 	if api.fieldMgrs[0] != DefaultFieldManager {
 		t.Errorf("field manager = %q, want %q", api.fieldMgrs[0], DefaultFieldManager)
 	}
+	if !api.forces[0] {
+		t.Error("fragment-key apply must force conflict resolution")
+	}
+}
+
+// Production carried this exact managed-fields shape: external-dns owned the fragment key via
+// Update, while the provider tried to write it via Apply. Kubernetes treats those as distinct
+// ownership identities even though the manager string is the same. The client-go fake uses the
+// real structured-merge field manager, so this test reproduces the conflict without a cluster.
+func TestApply_TakesOverUpdateOwnedKeyWithServerSideApply(t *testing.T) {
+	ctx := context.Background()
+	const (
+		namespace    = "kube-system"
+		name         = "coredns-fragments"
+		otherKey     = "another-owner.override"
+		otherManager = "another-owner"
+	)
+
+	client := k8sfake.NewClientset()
+	api := client.CoreV1().ConfigMaps(namespace)
+	existing := map[string]string{
+		"keep.edns.woven": "keep.apps.svc.cluster.local",
+	}
+	_, err := api.Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Data: map[string]string{
+			DefaultKey: render(existing),
+			otherKey:   "forward . 1.1.1.1\n",
+		},
+	}, metav1.CreateOptions{FieldManager: DefaultFieldManager})
+	if err != nil {
+		t.Fatalf("seed Update-owned ConfigMap: %v", err)
+	}
+	// Give the unrelated key to a genuinely separate owner. This leaves the production-shaped
+	// external-dns/Update ownership on DefaultKey while making any scope widening observable.
+	_, err = api.Apply(ctx,
+		corev1apply.ConfigMap(name, namespace).WithData(map[string]string{otherKey: "forward . 1.1.1.1\n"}),
+		metav1.ApplyOptions{FieldManager: otherManager, Force: true})
+	if err != nil {
+		t.Fatalf("give unrelated key to its owner: %v", err)
+	}
+
+	seeded, err := api.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get seeded ConfigMap: %v", err)
+	}
+	if !operationOwnsKey(t, seeded.ManagedFields, DefaultFieldManager, metav1.ManagedFieldsOperationUpdate, DefaultKey) {
+		t.Fatalf("fixture does not reproduce production: %s/Update does not own %s", DefaultFieldManager, DefaultKey)
+	}
+	if !operationOwnsKey(t, seeded.ManagedFields, otherManager, metav1.ManagedFieldsOperationApply, otherKey) {
+		t.Fatalf("fixture does not isolate %s under manager %s", otherKey, otherManager)
+	}
+
+	// Prove that the production-shaped fixture really conflicts without Force before exercising
+	// Fragment.Apply's conflict-resolution behavior.
+	desired := map[string]string{
+		"keep.edns.woven": "keep.apps.svc.cluster.local",
+		"new.edns.woven":  "new.apps.svc.cluster.local",
+	}
+	_, err = api.Apply(ctx,
+		corev1apply.ConfigMap(name, namespace).WithData(map[string]string{DefaultKey: render(desired)}),
+		metav1.ApplyOptions{FieldManager: DefaultFieldManager})
+	if err == nil {
+		t.Fatal("non-forced Apply unexpectedly took over the Update-owned fragment key")
+	}
+	if !strings.Contains(err.Error(), `conflict with "external-dns"`) ||
+		!strings.Contains(err.Error(), ".data."+DefaultKey) {
+		t.Fatalf("non-forced Apply returned the wrong error: %v", err)
+	}
+
+	fragment, err := New(Config{API: api, Name: name})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := fragment.Apply(ctx,
+		map[string]string{"new.edns.woven": "new.apps.svc.cluster.local"}, nil); err != nil {
+		t.Fatalf("forced fragment Apply: %v", err)
+	}
+
+	live, err := api.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get applied ConfigMap: %v", err)
+	}
+	if got := parseRewrites(live.Data[DefaultKey]); !sameRewrites(got, desired) {
+		t.Fatalf("fragment rewrites = %v, want %v", got, desired)
+	}
+	if got, want := live.Data[otherKey], "forward . 1.1.1.1\n"; got != want {
+		t.Fatalf("unrelated key changed: got %q, want %q", got, want)
+	}
+	if !operationOwnsKey(t, live.ManagedFields, DefaultFieldManager, metav1.ManagedFieldsOperationApply, DefaultKey) {
+		t.Errorf("%s/Apply does not own %s after forced takeover", DefaultFieldManager, DefaultKey)
+	}
+	if operationOwnsKey(t, live.ManagedFields, DefaultFieldManager, metav1.ManagedFieldsOperationUpdate, DefaultKey) {
+		t.Errorf("%s/Update still owns %s after forced takeover", DefaultFieldManager, DefaultKey)
+	}
+	if !operationOwnsKey(t, live.ManagedFields, otherManager, metav1.ManagedFieldsOperationApply, otherKey) {
+		t.Errorf("forced apply stole or removed the unrelated key's ownership")
+	}
+}
+
+func operationOwnsKey(t *testing.T, entries []metav1.ManagedFieldsEntry, manager string, operation metav1.ManagedFieldsOperationType, key string) bool {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.Manager != manager || entry.Operation != operation || entry.FieldsV1 == nil {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(entry.FieldsV1.Raw, &fields); err != nil {
+			t.Fatalf("decode managed fields for %s/%s: %v", manager, operation, err)
+		}
+		data, ok := fields["f:data"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := data["f:"+key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // A reconcile that changes nothing must not write. Every write bumps resourceVersion and can

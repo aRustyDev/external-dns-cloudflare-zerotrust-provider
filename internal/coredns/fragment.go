@@ -180,7 +180,12 @@ func (f *Fragment) Apply(ctx context.Context, add map[string]string, remove []st
 	}
 
 	cm := corev1apply.ConfigMap(f.name, "").WithData(map[string]string{f.key: render(desired)})
-	if _, err := f.api.Apply(ctx, cm, metav1.ApplyOptions{FieldManager: f.fieldManager}); err != nil {
+	// Force is deliberately scoped to this one data key by the apply configuration above. It
+	// reclaims the key when a historical client-side update recorded it under the same manager's
+	// Update identity: Kubernetes treats (manager, operation, subresource) as the owner, so an
+	// Apply otherwise conflicts despite the matching manager name. The takeover is one-shot; the
+	// successful apply records this manager as the Apply owner from then on.
+	if _, err := f.api.Apply(ctx, cm, metav1.ApplyOptions{FieldManager: f.fieldManager, Force: true}); err != nil {
 		return nil, fmt.Errorf("apply configmap %s key %s: %w", f.name, f.key, err)
 	}
 	return desired, nil
