@@ -223,8 +223,17 @@ Both orders leave a brief window where a hostname has one leg and not the other;
 unavoidable (a route with no answer and an answer with no route both fail to resolve). Only
 recovery-after-failure distinguishes them.
 
-A reconcile that changes nothing does **not** write, since every write bumps `resourceVersion` and
-can trigger a CoreDNS reload.
+A fully converged reconcile does **not** write, since every write bumps `resourceVersion` and can
+trigger a CoreDNS reload. There is one deliberate reconciliation seam: ExternalDNS compares only
+the canonical Cloudflare CNAME, not an endpoint's `resource` label. When an annotated Service is
+replaced under an existing hostname route, the route plan is therefore empty even though the
+CoreDNS target changed. `AdjustEndpoints` sees that desired Service label on every cycle, so this
+provider uses the preceding `Records()` snapshot to reconcile existing provider-owned routes'
+CoreDNS targets there. This is an intentional, bounded side effect of `AdjustEndpoints`: the
+ExternalDNS provider interface gives it no request context and never calls `ApplyChanges` for a
+zero route diff. New routes and deletes still use the normal `ApplyChanges` path and its
+fragment-first ordering; the fragment's idempotence suppresses a write when the target already
+matches. `DRY_RUN=true` suppresses this reconciliation write too.
 
 > **Interaction with IaC drift guards.** This key is written by a *runtime* writer, not by your IaC,
 > so a guard that diffs rendered IaC against the live ConfigMap will see it as drift. Allowlist it.

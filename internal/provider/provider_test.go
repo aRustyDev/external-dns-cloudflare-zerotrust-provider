@@ -854,6 +854,120 @@ func TestCoreDNS_WritesBothLegsFromOneAnnotation(t *testing.T) {
 	}
 }
 
+// A Service replacement keeps the Cloudflare route's tunnel CNAME exactly the same. ExternalDNS
+// therefore calculates no route change and never calls ApplyChanges, but its resource label now
+// names the replacement Service and the CoreDNS leg must converge to it. This is the production
+// shape that otherwise leaves a hostname pointing at a deleted namespace forever.
+func TestCoreDNS_AdjustEndpointsRetargetsExistingRouteWithEmptyCloudflarePlan(t *testing.T) {
+	const host = "vector.data.woven"
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "route-vector", Hostname: host, TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+	frag := &fakeFragment{rewrites: map[string]string{
+		host: "vector-data-proxy.qdrant-spike.svc.cluster.local",
+	}}
+	p, _, _ := corednsHarness(t, api, frag, false)
+
+	// This is ExternalDNS's order: Records supplies the current route snapshot, then the Service
+	// source supplies desired endpoints to AdjustEndpoints.
+	current, err := p.Records(context.Background())
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	desired, err := p.AdjustEndpoints([]*endpoint.Endpoint{
+		svcEndpoint(host, "service/qdrant/qdrant-tls-proxy"),
+	})
+	if err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+
+	// The canonical CNAME makes the route plan empty. Simulate the controller's no-op branch:
+	// it would log "All records are already up to date" and must not call ApplyChanges.
+	planned := (&plan.Plan{
+		Policies:       []plan.Policy{&plan.SyncPolicy{}},
+		Current:        current,
+		Desired:        desired,
+		DomainFilter:   endpoint.MatchAllDomainFilters{p.domainFilter},
+		ManagedRecords: []string{endpoint.RecordTypeCNAME},
+	}).Calculate()
+	if planned.Changes.HasChanges() {
+		t.Fatalf("Cloudflare plan = %+v, want no changes", planned.Changes)
+	}
+	if len(api.created) != 0 || len(api.deleted) != 0 {
+		t.Fatalf("zero route diff must not mutate Cloudflare: created=%v deleted=%v", api.created, api.deleted)
+	}
+	if got := frag.rewrites[host]; got != "qdrant-tls-proxy.qdrant.svc.cluster.local" {
+		t.Errorf("CoreDNS target = %q, want replacement Service target", got)
+	}
+	if len(frag.applies) != 1 {
+		t.Errorf("fragment applies = %d, want 1 retarget", len(frag.applies))
+	}
+}
+
+// This reconciliation path is a mutation path too. The webhook's own dry-run gate must protect
+// it even when ExternalDNS would see no Cloudflare changes and skip ApplyChanges.
+func TestCoreDNS_AdjustEndpointsExistingRouteHonorsDryRun(t *testing.T) {
+	const host = "vector.data.woven"
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "route-vector", Hostname: host, TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+	frag := &fakeFragment{rewrites: map[string]string{
+		host: "vector-data-proxy.qdrant-spike.svc.cluster.local",
+	}}
+	p, reg, _ := corednsHarness(t, api, frag, true)
+
+	if _, err := p.Records(context.Background()); err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if _, err := p.AdjustEndpoints([]*endpoint.Endpoint{
+		svcEndpoint(host, "service/qdrant/qdrant-tls-proxy"),
+	}); err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+	if len(frag.applies) != 0 {
+		t.Fatalf("dry run wrote the fragment: %+v", frag.applies)
+	}
+	if got := frag.rewrites[host]; got != "vector-data-proxy.qdrant-spike.svc.cluster.local" {
+		t.Errorf("dry run retargeted CoreDNS to %q", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": "fragment"}); got != 1 {
+		t.Errorf("dry_run_skipped_total{fragment} = %v, want 1", got)
+	}
+}
+
+// The zero-diff repair inherits Records' ownership boundary. In strict mode a route belonging
+// to another ExternalDNS owner must not authorize this instance to retarget the shared CoreDNS
+// fragment, even if a Service presents the same hostname.
+func TestCoreDNS_AdjustEndpointsPreservesStrictRouteOwnership(t *testing.T) {
+	const host = "vector.data.woven"
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "route-vector", Hostname: host, TunnelID: testTunnel, Comment: "managed-by=external-dns/other"},
+	}}
+	frag := &fakeFragment{rewrites: map[string]string{
+		host: "vector-data-proxy.qdrant-spike.svc.cluster.local",
+	}}
+	p, _, _ := corednsHarness(t, api, frag, false)
+
+	current, err := p.Records(context.Background())
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if len(current) != 0 {
+		t.Fatalf("strict Records = %v, want route owned by another provider filtered out", current)
+	}
+	if _, err := p.AdjustEndpoints([]*endpoint.Endpoint{
+		svcEndpoint(host, "service/qdrant/qdrant-tls-proxy"),
+	}); err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+	if len(frag.applies) != 0 {
+		t.Fatalf("retargeted a route outside strict ownership: %+v", frag.applies)
+	}
+	if got := frag.rewrites[host]; got != "vector-data-proxy.qdrant-spike.svc.cluster.local" {
+		t.Errorf("CoreDNS target = %q, want other owner's target untouched", got)
+	}
+}
+
 // THE convergence property: the fragment must be written BEFORE Cloudflare. ExternalDNS plans from
 // Records(), which reads Cloudflare, so if Cloudflare went first a failed fragment write would
 // leave the plan with nothing to retry and the hostname permanently half-configured.
