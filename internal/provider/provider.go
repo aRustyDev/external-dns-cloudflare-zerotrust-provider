@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"sigs.k8s.io/external-dns/endpoint"
@@ -53,6 +54,11 @@ import (
 
 // recordType is the type we synthesize for every managed hostname route.
 const recordType = endpoint.RecordTypeCNAME
+
+// corednsReconcileTimeout bounds the CoreDNS-only repair performed from AdjustEndpoints. The
+// ExternalDNS provider interface does not pass that method a request context, so an unbounded
+// Kubernetes call there could wedge a webhook reconciliation indefinitely.
+const corednsReconcileTimeout = 15 * time.Second
 
 // managedByPrefix is the comment prefix stamped on every route this project creates.
 const managedByPrefix = "managed-by=external-dns"
@@ -96,6 +102,14 @@ type Provider struct {
 	domainFilter    *endpoint.DomainFilter
 	metrics         *metrics.Metrics
 	log             *slog.Logger
+
+	// recordsHosts is the provider-owned route snapshot returned by the most recent Records
+	// call. ExternalDNS calls Records before AdjustEndpoints in every reconciliation; retaining
+	// only the hostname lets AdjustEndpoints repair CoreDNS for an already-existing route even
+	// when canonicalization makes the Cloudflare plan empty. The mutex keeps concurrent webhook
+	// requests from observing a partially replaced snapshot.
+	recordsHostsMu sync.RWMutex
+	recordsHosts   map[string]struct{}
 }
 
 // Config configures a Provider.
@@ -225,7 +239,34 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 		}
 	}
 	p.metrics.SetRecordsManaged(len(out))
+	p.rememberRecordHosts(out)
 	return out, nil
+}
+
+// rememberRecordHosts records exactly the route names this provider exposed to ExternalDNS in
+// the current reconciliation. In ownership-strict mode that means only routes carrying this
+// provider's owner tag; CoreDNS is therefore never retargeted merely because some other writer
+// happens to own the same Cloudflare hostname route.
+func (p *Provider) rememberRecordHosts(records []*endpoint.Endpoint) {
+	hosts := make(map[string]struct{}, len(records))
+	for _, ep := range records {
+		hosts[strings.ToLower(ep.DNSName)] = struct{}{}
+	}
+	p.recordsHostsMu.Lock()
+	p.recordsHosts = hosts
+	p.recordsHostsMu.Unlock()
+}
+
+// recordHosts returns a copy so a reconciliation never holds the cache lock while calling the
+// Kubernetes API through the CoreDNS fragment writer.
+func (p *Provider) recordHosts() map[string]struct{} {
+	p.recordsHostsMu.RLock()
+	defer p.recordsHostsMu.RUnlock()
+	hosts := make(map[string]struct{}, len(p.recordsHosts))
+	for host := range p.recordsHosts {
+		hosts[host] = struct{}{}
+	}
+	return hosts
 }
 
 // AdjustEndpoints canonicalizes candidate endpoints so plan diffs are stable: everything we
@@ -254,6 +295,22 @@ func (p *Provider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.
 			adjusted.Labels[k] = v
 		}
 		out = append(out, adjusted)
+	}
+	// ExternalDNS deliberately ignores endpoint labels while calculating its route plan. That is
+	// normally useful here: every desired endpoint canonicalizes to the same tunnel CNAME as an
+	// existing route, so replacing a Service leaves the Cloudflare plan empty. The resource label
+	// is nevertheless the desired state of leg 2. Reconcile only names seen in the preceding
+	// Records snapshot: new routes and deletes retain ApplyChanges' existing "fragment first,
+	// Cloudflare last" transaction, while an already-present route can still retarget CoreDNS.
+	//
+	// Provider.AdjustEndpoints has no context parameter. The webhook API does not expose the
+	// request context to this interface, so use a bounded internal context. A fragment failure
+	// must be returned so ExternalDNS retries the entire reconciliation rather than accepting a
+	// silently stale in-cluster answer.
+	ctx, cancel := context.WithTimeout(context.Background(), corednsReconcileTimeout)
+	defer cancel()
+	if err := p.reconcileExistingCoreDNS(ctx, out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -455,6 +512,35 @@ func (p *Provider) applyCoreDNS(ctx context.Context, changes *plan.Changes) erro
 	p.log.Info("updated CoreDNS fragment", "key", p.coredns.Key(),
 		"added", len(add), "removed", len(remove), "rewrites", len(after))
 	return nil
+}
+
+// reconcileExistingCoreDNS applies desired Service targets only for hostnames already exposed
+// by Records in this reconciliation. This closes the otherwise invisible replacement case:
+// the Cloudflare route's canonical CNAME is unchanged, so ExternalDNS has no ApplyChanges call,
+// but the Service resource label (and therefore the CoreDNS target) has changed.
+//
+// It intentionally does not remove names absent from desired endpoints. Deletion remains driven
+// by ExternalDNS's policy-filtered plan in ApplyChanges, preserving sync/upsert-only semantics
+// and avoiding a CoreDNS-only delete when the caller has disabled route deletion.
+func (p *Provider) reconcileExistingCoreDNS(ctx context.Context, desired []*endpoint.Endpoint) error {
+	if p.coredns == nil {
+		return nil
+	}
+	existing := p.recordHosts()
+	if len(existing) == 0 {
+		return nil
+	}
+
+	changes := &plan.Changes{}
+	for _, ep := range desired {
+		if _, ok := existing[strings.ToLower(ep.DNSName)]; ok {
+			changes.Create = append(changes.Create, ep)
+		}
+	}
+	if len(changes.Create) == 0 {
+		return nil
+	}
+	return p.applyCoreDNS(ctx, changes)
 }
 
 // adopt claims a pre-existing route for this owner by rewriting only its comment, leaving the
