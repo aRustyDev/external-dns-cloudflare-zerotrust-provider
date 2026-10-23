@@ -3,8 +3,9 @@
 How several instances of this provider share one Cloudflare account: how a hostname moves between
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
-**Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 7 (token isolation)
-and section 8 (live measurements) are added by the changes that produce them.
+**Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 8 lists the open
+questions about Cloudflare's behavior and the test that settles each; **none has been measured
+yet**. Section 7 (token isolation) is not written until section 8's scoped-token row is answered.
 
 ## 1. Scope and operator invariants
 
@@ -221,6 +222,51 @@ owner's tunnels.
 Running it against a live instance's owner id is an outage window for every route it deletes,
 because that instance recreates whatever it still desires on its next reconcile. The usage text and
 the README both say so.
+
+## 8. Live measurements (spike)
+
+Six questions about Cloudflare's behavior shape this design, and none has been answered against a
+real account yet. Each row below is either `MEASURED <date>` with what was observed, or
+`UNVERIFIED` with the reason. **Nothing here is inferred.** A row changes only when someone runs
+the test and pastes its `OBSERVED` lines.
+
+The tests need throwaway tunnels and skip without them. They record what the API does, and none
+of them fails because the API refused something.
+
+```sh
+export CF_API_TOKEN=...  CF_ACCOUNT_ID=...
+export CF_TUNNEL_ID=...        # throwaway tunnel A
+export CF_TUNNEL_ID_B=...      # throwaway tunnel B
+export CF_API_TOKEN_SCOPED=... # row 2: an Account API Token bound to a role on tunnel A only
+export CF_TUNNEL_ID_DISPOSABLE=...  # row 5: this tunnel is DELETED by the test
+go test -tags=integration -v -count=1 \
+  -run 'TestLive(RetargetPreservesRouteID|ScopedToken|SoftDelete|WildcardVsExact|TunnelDelete|ListFilters)' \
+  ./test/integration/ | grep OBSERVED
+```
+
+| # | Question | Test | What the docs say | Status |
+|---|---|---|---|---|
+| 1 | Does `PATCH` with `tunnel_id` retarget a route and keep its id? Is a body with only `tunnel_id` accepted? | `TestLiveRetargetPreservesRouteID` | The teamnet routes API documents `tunnel_id` on update. Nothing found for hostname routes. | UNVERIFIED: no Cloudflare credentials were available. |
+| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | UNVERIFIED: no credentials, and no tunnel-scoped token to test with. |
+| 3 | After a route is deleted, how long does its hostname stay refused with `1108`? | `TestLiveSoftDeleteWindow` | Not documented. The API soft-deletes (`deleted_at`). | UNVERIFIED: no credentials. |
+| 4 | How is a wildcard stored, and is an exact create under it on another tunnel refused? Which wins when a client resolves the name? | `TestLiveWildcardVsExact` | One leading wildcard label is allowed and stored without the `*`. Precedence against an exact route is undocumented. | UNVERIFIED: no credentials. Resolution-time precedence also needs a WARP client, so this test can only answer the API half. |
+| 5 | What happens to a tunnel's hostname routes when the tunnel is deleted? | `TestLiveTunnelDeleteCascade` | Not documented. | UNVERIFIED: no credentials, and it needs a disposable tunnel. |
+| 6 | Does the list endpoint filter by `hostname` and by `comment`? How long a comment is accepted? | `TestLiveListFiltersAndCommentLimit` | Neither a comment limit nor list filters are documented. | UNVERIFIED: no credentials. |
+
+**What each answer decides.**
+
+- **Row 1** decides whether retargeting is the in-place `PATCH` that exists today, or needs the
+  delete-then-create fallback described in section 5, which opens a short gap.
+- **Row 2** decides section 7. If a token bound to one tunnel lists only its own routes, gets `409`
+  for a hostname held elsewhere, and is refused (`403` or `404`) when it patches or deletes a
+  foreign route, Cloudflare isolates tunnels natively and the work is a token recipe plus tests.
+  If it can see or touch routes on tunnels it does not cover, isolation needs a stateless
+  broker in front of the account token. Section 7 is not written until this row is answered.
+- **Row 3** bounds every handoff: the gap is this window plus one reconcile interval.
+- **Row 4** decides whether wildcard hostnames are safe to hand to another instance.
+- **Row 5** decides whether retiring a tunnel by deleting it first would orphan or remove routes.
+- **Row 6** decides whether the 409 classifier can look up one hostname instead of listing the
+  whole account, and whether the comment tag can carry more than the owner id.
 
 ## 9. Not built, and why
 
