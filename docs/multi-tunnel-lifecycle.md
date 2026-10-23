@@ -4,8 +4,10 @@ How several instances of this provider share one Cloudflare account: how a hostn
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
 **Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 8 lists the open
-questions about Cloudflare's behavior and the test that settles each; **none has been measured
-yet**. Section 7 (token isolation) is not written until section 8's scoped-token row is answered.
+questions about Cloudflare's behavior and the test that settles each. A first run on 2026-10-23
+measured the list filters and found that the token available cannot create hostname routes, so most
+rows are still unverified. Section 7 (token isolation) is not written until section 8's
+scoped-token row is answered.
 
 ## 1. Scope and operator invariants
 
@@ -225,13 +227,34 @@ the README both say so.
 
 ## 8. Live measurements (spike)
 
-Six questions about Cloudflare's behavior shape this design, and none has been answered against a
-real account yet. Each row below is either `MEASURED <date>` with what was observed, or
-`UNVERIFIED` with the reason. **Nothing here is inferred.** A row changes only when someone runs
-the test and pastes its `OBSERVED` lines.
+Six questions about Cloudflare's behavior shape this design. Each row below is either
+`MEASURED <date>` with what was observed, or `UNVERIFIED` with the reason. **Nothing here is
+inferred.** A row changes only when someone runs the test and pastes its `OBSERVED` lines.
 
 The tests need throwaway tunnels and skip without them. They record what the API does, and none
-of them fails because the API refused something.
+of them fails because the API refused something. A token that cannot write hostname routes at all
+makes them skip with that reason instead.
+
+### What the first run measured (2026-10-23)
+
+Run with an account API token holding Cloudflare One Connectors Read, Connector: WARP Read and
+Write, and Connector: cloudflared Read and Write, against an account that already held 10 tunnels
+and 76 hostname routes. Only tunnels and routes created for the run were touched, and the account
+was verified back to 10 tunnels and 76 routes afterwards.
+
+- **Tunnels can be created and deleted** with those permissions: three created, three deleted.
+- **Hostname routes can be listed** (HTTP 200).
+- **Hostname routes cannot be created.** Every `POST` returned `403` with error `10000`
+  ("Authentication error"), across six tests. The connector and cloudflared permissions do not
+  authorize writing hostname routes; that needs a Cloudflare One Networks write permission, as the
+  README already said for the older Tunnel permission.
+- **The list endpoint filters by `hostname=` and by `comment=`, both on an exact match.** With
+  `hostname=` it returned exactly one route. With `comment=` it returned exactly the 22 routes
+  carrying that comment, and every one matched.
+
+The third point is a data point for row 2, not its answer. A token that holds cloudflared Write is
+refused hostname-route writes, which suggests tunnel-level permissions may not govern hostname
+routes at all. Row 2 still needs a token actually bound to one tunnel.
 
 ```sh
 export CF_API_TOKEN=...  CF_ACCOUNT_ID=...
@@ -246,12 +269,12 @@ go test -tags=integration -v -count=1 \
 
 | # | Question | Test | What the docs say | Status |
 |---|---|---|---|---|
-| 1 | Does `PATCH` with `tunnel_id` retarget a route and keep its id? Is a body with only `tunnel_id` accepted? | `TestLiveRetargetPreservesRouteID` | The teamnet routes API documents `tunnel_id` on update. Nothing found for hostname routes. | UNVERIFIED: no Cloudflare credentials were available. |
-| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | UNVERIFIED: no credentials, and no tunnel-scoped token to test with. |
-| 3 | After a route is deleted, how long does its hostname stay refused with `1108`? | `TestLiveSoftDeleteWindow` | Not documented. The API soft-deletes (`deleted_at`). | UNVERIFIED: no credentials. |
-| 4 | How is a wildcard stored, and is an exact create under it on another tunnel refused? Which wins when a client resolves the name? | `TestLiveWildcardVsExact` | One leading wildcard label is allowed and stored without the `*`. Precedence against an exact route is undocumented. | UNVERIFIED: no credentials. Resolution-time precedence also needs a WARP client, so this test can only answer the API half. |
-| 5 | What happens to a tunnel's hostname routes when the tunnel is deleted? | `TestLiveTunnelDeleteCascade` | Not documented. | UNVERIFIED: no credentials, and it needs a disposable tunnel. |
-| 6 | Does the list endpoint filter by `hostname` and by `comment`? How long a comment is accepted? | `TestLiveListFiltersAndCommentLimit` | Neither a comment limit nor list filters are documented. | UNVERIFIED: no credentials. |
+| 1 | Does `PATCH` with `tunnel_id` retarget a route and keep its id? Is a body with only `tunnel_id` accepted? | `TestLiveRetargetPreservesRouteID` | The teamnet routes API documents `tunnel_id` on update. Nothing found for hostname routes. | UNVERIFIED: the token available cannot create the fixture route (403 `10000`, 2026-10-23). |
+| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | UNVERIFIED: there is no tunnel-scoped token to test with, and the token available cannot write hostname routes at all (403 `10000`, 2026-10-23). See the data point above. |
+| 3 | After a route is deleted, how long does its hostname stay refused with `1108`? | `TestLiveSoftDeleteWindow` | Not documented. The API soft-deletes (`deleted_at`). | UNVERIFIED: the token available cannot create routes (403 `10000`, 2026-10-23). |
+| 4 | How is a wildcard stored, and is an exact create under it on another tunnel refused? Which wins when a client resolves the name? | `TestLiveWildcardVsExact` | One leading wildcard label is allowed and stored without the `*`. Precedence against an exact route is undocumented. | UNVERIFIED: the token available cannot create routes (403 `10000`, 2026-10-23). Resolution-time precedence also needs a WARP client, so this test can only answer the API half. |
+| 5 | What happens to a tunnel's hostname routes when the tunnel is deleted? | `TestLiveTunnelDeleteCascade` | Not documented. | UNVERIFIED: it needs a route on the tunnel, and the token available cannot create routes (403 `10000`, 2026-10-23). Deleting a tunnel with no routes works. |
+| 6 | Does the list endpoint filter by `hostname` and by `comment`? How long a comment is accepted? | `TestLiveListFiltersAndCommentLimit` | Neither a comment limit nor list filters are documented. | **Filters: MEASURED 2026-10-23.** `hostname=` and `comment=` both filter, on an exact match (see above). **Comment limit: UNVERIFIED**, because it needs route creates (403 `10000`). |
 
 **What each answer decides.**
 
@@ -266,7 +289,8 @@ go test -tags=integration -v -count=1 \
 - **Row 4** decides whether wildcard hostnames are safe to hand to another instance.
 - **Row 5** decides whether retiring a tunnel by deleting it first would orphan or remove routes.
 - **Row 6** decides whether the 409 classifier can look up one hostname instead of listing the
-  whole account, and whether the comment tag can carry more than the owner id.
+  whole account, and whether the comment tag can carry more than the owner id. The filter half is
+  answered: a single-hostname lookup is possible. The comment-length half is not.
 
 ## 9. Not built, and why
 
@@ -276,6 +300,9 @@ go test -tags=integration -v -count=1 \
 - **A fast-retry loop inside the provider.** A webhook cannot trigger ExternalDNS reconciles, and a
   loop that creates from a stale snapshot can create a route for a Service that was just removed.
   The gap is bounded by `--interval`, which the runbook lowers.
+- **A hostname-filtered lookup in the 409 classifier.** The list endpoint supports `hostname=`
+  (section 8), so the classifier could fetch one route instead of listing the account. Not built:
+  it costs one list per `ApplyChanges` and only when a create conflicts.
 - **A claim registry or broker (Worker plus Durable Object).** Not needed for correctness: the 409
   is the mutex, the comment is the ownership record, and an owner's own delete is consent. A broker
   would add deterministic first-come ordering among several claimants and a zero-gap
