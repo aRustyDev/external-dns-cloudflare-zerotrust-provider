@@ -50,6 +50,36 @@ func observe(t *testing.T, label string, err error) {
 	t.Logf("OBSERVED %s: error=%v", label, err)
 }
 
+// routesForbidden reports whether err is Cloudflare refusing the request as an authentication
+// error (403, code 10000). For hostname-route writes that is what a token WITHOUT a Cloudflare One
+// Networks write permission gets: the connector and tunnel permissions do not cover these routes.
+func routesForbidden(err error) bool {
+	var apiErr *cloudflare.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusForbidden && cloudflare.HasCode(err, 10000)
+}
+
+// skipIfRoutesForbidden skips the test, with the reason, when err shows the token cannot write
+// hostname routes. A missing permission is a problem with the environment, not with the test, so it
+// must not read as a failure. Any other error is left for the caller.
+func skipIfRoutesForbidden(t *testing.T, what string, err error) {
+	t.Helper()
+	if routesForbidden(err) {
+		t.Skipf("%s: the token cannot create hostname routes (403 [10000]); it needs a Cloudflare One "+
+			"Networks write permission, which connector and tunnel permissions do not grant: %v", what, err)
+	}
+}
+
+// requireCreate handles the result of a FIXTURE create: it skips when the token lacks permission and
+// fails on any other error.
+func requireCreate(t *testing.T, what string, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	skipIfRoutesForbidden(t, what, err)
+	t.Fatalf("%s: %v", what, err)
+}
+
 // uniqueHost returns a hostname unique to this call. testHost cannot be used when a test needs
 // several, because it returns INTEGRATION_HOSTNAME verbatim whenever that is set.
 func uniqueHost(t *testing.T, tag string) string {

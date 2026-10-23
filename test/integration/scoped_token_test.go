@@ -59,9 +59,7 @@ func TestLiveScopedTokenHostnameRoutes(t *testing.T) {
 	// Fixture: a route on tunnel B that the scoped token has no business touching.
 	heldOnB := uniqueHost(t, "held-b")
 	foreign, err := admin.CreateHostnameRoute(ctx, heldOnB, tunnelB, comment)
-	if err != nil {
-		t.Fatalf("fixture: create %q on tunnel B with the unscoped token: %v", heldOnB, err)
-	}
+	requireCreate(t, "fixture: create "+heldOnB+" on tunnel B with the unscoped token", err)
 	cleanupHost(t, admin, heldOnB, tunnelA, tunnelB)
 
 	// Listing: what can the scoped token see?

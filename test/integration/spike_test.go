@@ -50,9 +50,7 @@ func TestLiveSoftDeleteWindow(t *testing.T) {
 	defer cancel()
 
 	first, err := c.CreateHostnameRoute(ctx, host, tunnel, spikeComment)
-	if err != nil {
-		t.Fatalf("create %q: %v", host, err)
-	}
+	requireCreate(t, "create "+host, err)
 	cleanupHost(t, c, host, tunnel)
 	if err := c.DeleteHostnameRoute(ctx, first.ID); err != nil {
 		t.Fatalf("delete %q: %v", host, err)
@@ -89,6 +87,7 @@ func TestLiveWildcardVsExact(t *testing.T) {
 	defer cancel()
 
 	wc, err := c.CreateHostnameRoute(ctx, wildcard, tunnelA, spikeComment)
+	skipIfRoutesForbidden(t, "create "+wildcard, err)
 	observe(t, "create of a wildcard hostname on tunnel A", err)
 	if err != nil {
 		return
@@ -121,9 +120,7 @@ func TestLiveTunnelDeleteCascade(t *testing.T) {
 	defer cancel()
 
 	created, err := c.CreateHostnameRoute(ctx, host, disposable, spikeComment)
-	if err != nil {
-		t.Fatalf("create %q on the disposable tunnel: %v", host, err)
-	}
+	requireCreate(t, "create "+host+" on the disposable tunnel", err)
 	t.Cleanup(func() { _ = c.DeleteHostnameRoute(context.Background(), created.ID) })
 
 	status, body, err := rawCall(ctx, token, http.MethodDelete, "/accounts/"+acct+"/cfd_tunnel/"+disposable, nil, "")
@@ -158,9 +155,8 @@ func TestLiveListFiltersAndCommentLimit(t *testing.T) {
 	hostX, hostY := uniqueHost(t, "filter-x"), uniqueHost(t, "filter-y")
 	commentX, commentY := spikeComment+"/filter-x", spikeComment+"/filter-y"
 	for host, comment := range map[string]string{hostX: commentX, hostY: commentY} {
-		if _, err := c.CreateHostnameRoute(ctx, host, tunnel, comment); err != nil {
-			t.Fatalf("fixture: create %q: %v", host, err)
-		}
+		_, err := c.CreateHostnameRoute(ctx, host, tunnel, comment)
+		requireCreate(t, "fixture: create "+host, err)
 		cleanupHost(t, c, host, tunnel)
 	}
 
