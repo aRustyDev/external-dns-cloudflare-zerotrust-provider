@@ -69,7 +69,7 @@ kubectl apply -f deploy/deployment.yaml
 | `CF_TUNNEL_ID` | conditional | — | Single-tunnel mode: tunnel the hostname routes bind to. Required unless `TUNNEL_MAP` is set |
 | `TUNNEL_MAP` | conditional | — | Multi-tunnel mode: `domain=tunnelID,...` (most-specific domain wins). Supersedes `CF_TUNNEL_ID` |
 | `TUNNEL_DRAIN` | no | — | Comma-separated tunnel IDs this instance still **lists and deletes from** but never creates on. Retire a tunnel by moving it here (see [Retiring a tunnel](#retiring-a-tunnel)). A tunnel may not also be configured |
-| `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`). **Must be unique per instance** in an account; the provider warns while it is still `default` (see [Multiple instances](#multiple-instances)) |
+| `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`). **Must be unique per instance** in an account, and at most 232 characters because Cloudflare limits a route comment to 256; the provider warns while it is still `default` (see [Multiple instances](#multiple-instances)) |
 | `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
 | `DRY_RUN` | no | `false` | Log intended route creates/deletes and make **no** mutating Cloudflare call (see [Dry run](#dry-run)) |
 | `ADOPT_UNTAGGED` | no | `false` | Claim a pre-existing route for a managed hostname instead of failing (see [Adopting existing routes](#adopting-existing-routes)) |
@@ -301,9 +301,8 @@ TUNNEL_DRAIN=<tunnel-a>
 `DRY_RUN=true` logs each intended retarget (`would RETARGET hostname route`) without making it.
 A failed retarget leaves the route where it was, and the next reconcile plans it again.
 
-> **Not yet verified against a live account:** that Cloudflare retargets on `PATCH` and keeps the
-> route id. `TestLiveRetargetPreservesRouteID` in `test/integration/` settles it. Run it before
-> relying on this in production.
+> Verified against a live account on 2026-10-23: Cloudflare retargets on `PATCH` and the route keeps
+> its id. `TestLiveRetargetPreservesRouteID` in `test/integration/` re-checks it.
 
 If you drop the old tunnel from the configuration *without* draining it, its routes are invisible
 to this instance, so the plan tries to create each host again on the new tunnel and Cloudflare
@@ -318,7 +317,8 @@ refuses. They show up as `cfzt_provider_routes_pending{reason="self"}`, and the 
 2. Watch `cfzt_provider_routes_by_tunnel{tunnel_id="<tunnel>"}`. It counts every live route this
    instance manages on that tunnel, **including ones outside the domain filter**. This instance
    never moves or deletes those, so remove them by hand.
-3. When it reads `0`, remove the tunnel from `TUNNEL_DRAIN`.
+3. When it reads `0`, remove the tunnel from `TUNNEL_DRAIN`. That is also what lets you delete the
+   tunnel itself: Cloudflare refuses to delete a tunnel that still has routes.
 
 Keep the API token able to read the draining tunnel until the gauge reaches `0`.
 

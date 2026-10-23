@@ -311,10 +311,9 @@ type RoutePatch struct {
 // result. It is the retarget primitive: setting TunnelID moves the hostname to another tunnel
 // while the route keeps its id, so there is no create/delete race and no resolution gap.
 //
-// NOT YET VERIFIED LIVE: that the API retargets on PATCH, that the route id survives, and whether
-// tunnel_id may be sent without hostname. The documented full body is {hostname, tunnel_id,
-// comment}, so callers should send all three. test/integration TestLiveRetargetPreservesRouteID
-// settles it; until it has been run against a real account, treat a retarget as unproven.
+// Verified live on 2026-10-23 (test/integration TestLiveRetargetPreservesRouteID): the API
+// retargets on PATCH and the route keeps its id, whether the body is the full {hostname, tunnel_id,
+// comment} or tunnel_id alone. Callers still send the full, documented form.
 //
 // Use PatchHostnameRouteComment for adoption instead: it cannot express a retarget by accident.
 func (c *Client) PatchHostnameRoute(ctx context.Context, id string, patch RoutePatch) (*HostnameRoute, error) {
