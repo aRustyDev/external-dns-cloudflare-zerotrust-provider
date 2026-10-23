@@ -46,9 +46,30 @@ type fakeAPI struct {
 	patchErr       error
 	createErr      error
 	nextID         int
+
+	// createErrFor fails the create of one hostname (lowercase) and wins over createErr.
+	createErrFor map[string]error
+	// listErrFor fails the list of one tunnel id; the key "" is the account-wide list.
+	listErrFor map[string]error
+	// enforce makes the fake behave like Cloudflare: a create for a hostname that already has a
+	// live route is refused with 409 / 1108, and a delete really removes the route. Off by default
+	// so older tests keep their simple record-only semantics.
+	enforce bool
+}
+
+// conflictErr is the error Cloudflare returns for a duplicate hostname route.
+func conflictErr() error {
+	return &cloudflare.APIError{
+		Method: "POST", StatusCode: 409,
+		Codes:   []int{cloudflare.ErrCodeHostnameAlreadyRouted},
+		Message: "[1108] Hostname Route already routed to another tunnel",
+	}
 }
 
 func (f *fakeAPI) ListHostnameRoutes(_ context.Context, tunnelID string) ([]cloudflare.HostnameRoute, error) {
+	if err, ok := f.listErrFor[tunnelID]; ok {
+		return nil, err
+	}
 	if tunnelID == "" {
 		return f.routes, nil
 	}
@@ -62,8 +83,18 @@ func (f *fakeAPI) ListHostnameRoutes(_ context.Context, tunnelID string) ([]clou
 }
 
 func (f *fakeAPI) CreateHostnameRoute(_ context.Context, hostname, tunnelID, comment string) (*cloudflare.HostnameRoute, error) {
+	if err, ok := f.createErrFor[strings.ToLower(hostname)]; ok {
+		return nil, err
+	}
 	if f.createErr != nil {
 		return nil, f.createErr
+	}
+	if f.enforce {
+		for _, r := range f.routes {
+			if r.DeletedAt == nil && strings.EqualFold(r.Hostname, hostname) {
+				return nil, conflictErr()
+			}
+		}
 	}
 	f.nextID++
 	r := cloudflare.HostnameRoute{ID: "id-" + hostname, Hostname: hostname, TunnelID: tunnelID, Comment: comment}
@@ -93,6 +124,15 @@ func (f *fakeAPI) PatchHostnameRouteComment(_ context.Context, id, comment strin
 
 func (f *fakeAPI) DeleteHostnameRoute(_ context.Context, id string) error {
 	f.deleted = append(f.deleted, id)
+	if f.enforce {
+		kept := f.routes[:0:0]
+		for _, r := range f.routes {
+			if r.ID != id {
+				kept = append(kept, r)
+			}
+		}
+		f.routes = kept
+	}
 	return nil
 }
 
@@ -681,26 +721,28 @@ func TestAdopt_DisabledByDefaultStillCreates(t *testing.T) {
 	}
 }
 
-// With adoption OFF, an existing route is not even looked at — the create runs and Cloudflare
-// 409s. Assert the error carries the actionable hint rather than the raw vendor message.
-func TestAdopt_OffSurfacesAlreadyRoutedHint(t *testing.T) {
-	api := &fakeAPI{createErr: &cloudflare.APIError{
-		Method: "POST", StatusCode: 409,
-		Codes:   []int{cloudflare.ErrCodeHostnameAlreadyRouted},
-		Message: "[1108] Hostname Route already routed to another tunnel",
+// With adoption OFF an existing route is not even looked at, so the create runs and Cloudflare
+// refuses it. That is a PENDING host, not a failure: the operator gets the actionable hint in the
+// log and in routes_pending{untagged}, and ApplyChanges returns nil so ExternalDNS does not count
+// a registry error every cycle. (This used to be returned as an error; see the multi-instance
+// design for why that was wrong.)
+func TestAdopt_OffSurfacesAlreadyRoutedHintAsPending(t *testing.T) {
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-legacy", Hostname: "legacy.private", TunnelID: testTunnel, Comment: "managed by opentofu"},
 	}}
-	p, _, _ := adoptHarness(t, api, false)
+	p, reg, logs := adoptHarness(t, api, false)
 
-	err := p.ApplyChanges(context.Background(), createPlan(p, "legacy.private"))
-	if err == nil {
-		t.Fatal("want an error when Cloudflare rejects the duplicate")
+	if err := p.ApplyChanges(context.Background(), createPlan(p, "legacy.private")); err != nil {
+		t.Fatalf("a refused duplicate is pending, not an error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "ADOPT_UNTAGGED=true") {
-		t.Errorf("error should point at the fix; got: %v", err)
+	if !strings.Contains(logs.String(), "ADOPT_UNTAGGED=true") {
+		t.Errorf("log should point at the fix; got:\n%s", logs.String())
 	}
-	var apiErr *cloudflare.APIError
-	if !errors.As(err, &apiErr) {
-		t.Errorf("error should still wrap the APIError for code inspection; got %T", err)
+	if got := metricValue(t, reg, "cfzt_provider_routes_pending", map[string]string{"reason": "untagged"}); got != 1 {
+		t.Errorf("routes_pending{untagged} = %v, want 1", got)
+	}
+	if len(api.created) != 0 {
+		t.Errorf("nothing should have been created: %v", api.created)
 	}
 }
 
@@ -1190,4 +1232,395 @@ func names(eps []*endpoint.Endpoint) []string {
 		out = append(out, e.DNSName)
 	}
 	return out
+}
+
+// --- per-host apply, pending conflicts and multi-instance safety ----------------------------
+
+const (
+	tunnelA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	tunnelB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	tunnelC = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+)
+
+// ownerProvider builds an ownership-strict provider for one owner on one tunnel, with metrics and
+// a capturing logger at the default (Info) level.
+func ownerProvider(t *testing.T, api routeAPI, owner, tunnel string) (*Provider, *prometheus.Registry, *bytes.Buffer) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client: api, TunnelID: tunnel, OwnerID: owner, OwnershipStrict: true,
+		DomainFilter: []string{"private"}, Metrics: m,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p, reg, &logs
+}
+
+// cnamePlan builds a plan creating and deleting the given hostnames. Targets are irrelevant to
+// ApplyChanges, which resolves the tunnel itself.
+func cnamePlan(creates, deletes []string) *plan.Changes {
+	mk := func(h string) *endpoint.Endpoint { return endpoint.NewEndpoint(h, endpoint.RecordTypeCNAME, "") }
+	c := &plan.Changes{}
+	for _, h := range creates {
+		c.Create = append(c.Create, mk(h))
+	}
+	for _, h := range deletes {
+		c.Delete = append(c.Delete, mk(h))
+	}
+	return c
+}
+
+func pendingValue(t *testing.T, reg *prometheus.Registry, reason string) float64 {
+	t.Helper()
+	return metricValue(t, reg, "cfzt_provider_routes_pending", map[string]string{"reason": reason})
+}
+
+// liveRoute returns the live route for host in the fake, if any.
+func liveRoute(api *fakeAPI, host string) (cloudflare.HostnameRoute, bool) {
+	for _, r := range api.routes {
+		if r.DeletedAt == nil && strings.EqualFold(r.Hostname, host) {
+			return r, true
+		}
+	}
+	return cloudflare.HostnameRoute{}, false
+}
+
+// Deletes run before creates so a name this instance gives up is released as early as possible.
+func TestApplyChanges_DeletesRunBeforeCreates(t *testing.T) {
+	var order []string
+	base := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-old.private", Hostname: "old.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+	p := strictProvider(t, &orderingAPI{fakeAPI: base, order: &order}, "test", "private")
+
+	if err := p.ApplyChanges(context.Background(), cnamePlan([]string{"new.private"}, []string{"old.private"})); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if got := strings.Join(order, ","); got != "cf-delete,cf-create" {
+		t.Fatalf("cloudflare order = %q, want deletes before creates", got)
+	}
+}
+
+// The deadlock this change exists to remove. Instance x gives up foo and wants bar; instance y
+// gives up bar and wants foo. Each used to hit a 409 on its create and return before reaching its
+// delete, so neither ever released anything. Now a refused create is pending rather than fatal, so
+// every instance makes progress and the swap completes within two cycles of the first mover.
+func TestApplyChanges_SwapConvergesWithoutDeadlock(t *testing.T) {
+	ctx := context.Background()
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-foo", Hostname: "foo.private", TunnelID: tunnelA, Comment: "managed-by=external-dns/x"},
+		{ID: "id-bar", Hostname: "bar.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/y"},
+	}}
+	px, regX, _ := ownerProvider(t, api, "x", tunnelA)
+	py, _, _ := ownerProvider(t, api, "y", tunnelB)
+
+	// x runs first. bar is still held by y, so its create is pending, but the delete of foo ran.
+	if err := px.ApplyChanges(ctx, cnamePlan([]string{"bar.private"}, []string{"foo.private"})); err != nil {
+		t.Fatalf("x cycle 1: a held hostname is pending, not an error: %v", err)
+	}
+	if _, held := liveRoute(api, "foo.private"); held {
+		t.Fatal("x did not release foo.private, so y can never claim it (the old deadlock)")
+	}
+	if got := pendingValue(t, regX, metrics.PendingOther); got != 1 {
+		t.Errorf("x routes_pending{other} = %v, want 1 (bar is held by y)", got)
+	}
+
+	// y runs: it releases bar and claims foo in the same pass.
+	if err := py.ApplyChanges(ctx, cnamePlan([]string{"foo.private"}, []string{"bar.private"})); err != nil {
+		t.Fatalf("y cycle 1: %v", err)
+	}
+	if r, ok := liveRoute(api, "foo.private"); !ok || r.TunnelID != tunnelB {
+		t.Fatalf("foo.private = %+v (live=%v), want it on y's tunnel", r, ok)
+	}
+
+	// x's next reconcile picks bar up.
+	if err := px.ApplyChanges(ctx, cnamePlan([]string{"bar.private"}, nil)); err != nil {
+		t.Fatalf("x cycle 2: %v", err)
+	}
+	if r, ok := liveRoute(api, "bar.private"); !ok || r.TunnelID != tunnelA {
+		t.Fatalf("bar.private = %+v (live=%v), want it on x's tunnel", r, ok)
+	}
+	if got := pendingValue(t, regX, metrics.PendingOther); got != 0 {
+		t.Errorf("x routes_pending{other} = %v after the handoff, want 0", got)
+	}
+}
+
+// A refused duplicate must not fail the batch: the other creates and the deletes still happen, the
+// host's CoreDNS rewrite stays staged for when the create finally lands, and the holder's owner id
+// does not appear in logs at the default level.
+func TestApplyChanges_409IsPendingNotError(t *testing.T) {
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-held", Hostname: "held.edns.woven", TunnelID: tunnelB, Comment: "managed-by=external-dns/secret-owner"},
+		{ID: "id-gone", Hostname: "gone.edns.woven", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+	}}
+	frag := &fakeFragment{}
+	p, reg, logs := corednsHarness(t, api, frag, false)
+
+	err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{
+			svcEndpoint("ok.edns.woven", "service/apps/ok"),
+			svcEndpoint("held.edns.woven", "service/apps/held"),
+		},
+		Delete: []*endpoint.Endpoint{svcEndpoint("gone.edns.woven", "service/apps/gone")},
+	})
+	if err != nil {
+		t.Fatalf("a refused duplicate must not fail the batch: %v", err)
+	}
+	if len(api.created) != 1 || api.created[0] != "ok.edns.woven" {
+		t.Errorf("created = %v, want [ok.edns.woven]", api.created)
+	}
+	if len(api.deleted) != 1 || api.deleted[0] != "id-gone" {
+		t.Errorf("deleted = %v, want [id-gone]", api.deleted)
+	}
+	if got := pendingValue(t, reg, metrics.PendingOther); got != 1 {
+		t.Errorf("routes_pending{other} = %v, want 1", got)
+	}
+	if _, staged := frag.rewrites["held.edns.woven"]; !staged {
+		t.Error("the pending host's rewrite must stay staged for when the create lands")
+	}
+	if strings.Contains(logs.String(), "secret-owner") {
+		t.Errorf("another owner's id leaked into default-level logs:\n%s", logs.String())
+	}
+}
+
+// The 409 is not always someone else's. If a tunnel left TUNNEL_MAP without being drained, this
+// instance's OWN route on it is invisible to Records, the plan re-creates the host, and nothing
+// will ever release it. That must be reported as self, with the fix named.
+func TestApplyChanges_409BySelfOnUnlistedTunnel(t *testing.T) {
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-foo", Hostname: "foo.private", TunnelID: tunnelC, Comment: "managed-by=external-dns/test"},
+	}}
+	p, reg, logs := ownerProvider(t, api, "test", tunnelA)
+
+	if err := p.ApplyChanges(context.Background(), cnamePlan([]string{"foo.private"}, nil)); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingSelf); got != 1 {
+		t.Errorf("routes_pending{self} = %v, want 1", got)
+	}
+	if !strings.Contains(logs.String(), "TUNNEL_DRAIN") {
+		t.Errorf("log should name TUNNEL_DRAIN as the fix; got:\n%s", logs.String())
+	}
+}
+
+// When the token cannot see the holder (a scoped token), the conflict is still pending; it is just
+// unattributed.
+func TestApplyChanges_409WithInvisibleHolderIsUnknown(t *testing.T) {
+	api := &fakeAPI{createErrFor: map[string]error{"foo.private": conflictErr()}}
+	p, reg, _ := ownerProvider(t, api, "test", tunnelA)
+
+	if err := p.ApplyChanges(context.Background(), cnamePlan([]string{"foo.private"}, nil)); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingUnknown); got != 1 {
+		t.Errorf("routes_pending{unknown} = %v, want 1", got)
+	}
+}
+
+// Naming the holder is best effort. If the account-wide list fails, the host is still pending and
+// the failure is counted, not turned into a failed batch.
+func TestApplyChanges_ConflictLookupFailureStillPending(t *testing.T) {
+	api := &fakeAPI{
+		createErrFor: map[string]error{"foo.private": conflictErr()},
+		listErrFor:   map[string]error{"": errors.New("403 forbidden")},
+	}
+	p, reg, _ := ownerProvider(t, api, "test", tunnelA)
+
+	if err := p.ApplyChanges(context.Background(), cnamePlan([]string{"foo.private"}, nil)); err != nil {
+		t.Fatalf("a failed holder lookup must not fail the batch: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingUnknown); got != 1 {
+		t.Errorf("routes_pending{unknown} = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_list_errors_total", map[string]string{"tunnel_id": "account"}); got != 1 {
+		t.Errorf("list_errors_total{account} = %v, want 1", got)
+	}
+}
+
+// Anything that is not a duplicate is a real failure. It is reported, but it does not stop the
+// rest of the batch.
+func TestApplyChanges_NonConflictErrorsAreJoinedAndDoNotBlock(t *testing.T) {
+	api := &fakeAPI{
+		routes: []cloudflare.HostnameRoute{
+			{ID: "id-old.private", Hostname: "old.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+		},
+		createErrFor: map[string]error{
+			"bad1.private": errors.New("boom one"),
+			"bad2.private": errors.New("boom two"),
+		},
+	}
+	p := strictProvider(t, api, "test", "private")
+
+	err := p.ApplyChanges(context.Background(),
+		cnamePlan([]string{"bad1.private", "good.private", "bad2.private"}, []string{"old.private"}))
+	if err == nil {
+		t.Fatal("want the joined failures")
+	}
+	for _, want := range []string{"bad1.private", "boom one", "bad2.private", "boom two"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+	if len(api.created) != 1 || api.created[0] != "good.private" {
+		t.Errorf("created = %v, want [good.private]", api.created)
+	}
+	if len(api.deleted) != 1 || api.deleted[0] != "id-old.private" {
+		t.Errorf("deleted = %v, want [id-old.private]", api.deleted)
+	}
+}
+
+// One endpoint with no resource label must not stop another host from getting both legs.
+func TestApplyChanges_MissingResourceLabelSkipsOnlyThatHost(t *testing.T) {
+	api := &fakeAPI{}
+	frag := &fakeFragment{}
+	p, _, _ := corednsHarness(t, api, frag, false)
+
+	err := p.ApplyChanges(context.Background(), &plan.Changes{Create: []*endpoint.Endpoint{
+		svcEndpoint("good.edns.woven", "service/apps/good"),
+		svcEndpoint("nolabel.edns.woven", ""),
+	}})
+	if err == nil || !strings.Contains(err.Error(), "nolabel.edns.woven") {
+		t.Fatalf("want an error naming the skipped host; got %v", err)
+	}
+	if len(api.created) != 1 || api.created[0] != "good.edns.woven" {
+		t.Errorf("created = %v, want only [good.edns.woven]", api.created)
+	}
+	if _, ok := frag.rewrites["good.edns.woven"]; !ok {
+		t.Error("the healthy host should still get its rewrite")
+	}
+	if _, ok := frag.rewrites["nolabel.edns.woven"]; ok {
+		t.Error("the skipped host must not get a rewrite")
+	}
+}
+
+// A CoreDNS "rewrite name exact" rule cannot match a wildcard, so with leg 2 enabled a wildcard
+// hostname is refused for that host; without leg 2 it is an ordinary route.
+func TestApplyChanges_WildcardRejectedWithCoreDNS(t *testing.T) {
+	api := &fakeAPI{}
+	frag := &fakeFragment{}
+	p, _, _ := corednsHarness(t, api, frag, false)
+
+	err := p.ApplyChanges(context.Background(), &plan.Changes{Create: []*endpoint.Endpoint{
+		svcEndpoint("*.edns.woven", "service/apps/wild"),
+	}})
+	if err == nil || !strings.Contains(err.Error(), "wildcard") {
+		t.Fatalf("want a wildcard error; got %v", err)
+	}
+	if len(api.created) != 0 || len(frag.applies) != 0 {
+		t.Errorf("nothing should be written: created=%v applies=%v", api.created, frag.applies)
+	}
+}
+
+func TestApplyChanges_WildcardAcceptedWithoutCoreDNS(t *testing.T) {
+	api := &fakeAPI{}
+	p, _, _ := corednsHarness(t, api, nil, false)
+
+	if err := p.ApplyChanges(context.Background(), &plan.Changes{Create: []*endpoint.Endpoint{
+		svcEndpoint("*.edns.woven", ""),
+	}}); err != nil {
+		t.Fatalf("a wildcard route is fine when leg 2 is off: %v", err)
+	}
+	if len(api.created) != 1 {
+		t.Errorf("created = %v, want the wildcard route", api.created)
+	}
+}
+
+// pending must clear on evidence, or an alert on routes_pending > 0 sticks forever. There are
+// three ways out, and the last two happen on cycles where ExternalDNS never calls ApplyChanges.
+
+func pendingFixture(t *testing.T) (*Provider, *fakeAPI, *prometheus.Registry) {
+	t.Helper()
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-foo", Hostname: "foo.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/y"},
+	}}
+	p, reg, _ := ownerProvider(t, api, "x", tunnelA)
+	if err := p.ApplyChanges(context.Background(), cnamePlan([]string{"foo.private"}, nil)); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingOther); got != 1 {
+		t.Fatalf("fixture: routes_pending{other} = %v, want 1", got)
+	}
+	return p, api, reg
+}
+
+func TestPending_ClearsWhenTheCreateSucceeds(t *testing.T) {
+	p, api, reg := pendingFixture(t)
+	api.routes = nil // the holder let go
+
+	if err := p.ApplyChanges(context.Background(), cnamePlan([]string{"foo.private"}, nil)); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingOther); got != 0 {
+		t.Errorf("routes_pending{other} = %v after the create landed, want 0", got)
+	}
+}
+
+func TestPending_ClearsWhenTheAnnotationIsRemoved(t *testing.T) {
+	p, _, reg := pendingFixture(t)
+
+	// Nothing desires foo any more, so ExternalDNS plans nothing and never calls ApplyChanges.
+	if _, err := p.AdjustEndpoints(nil); err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingOther); got != 0 {
+		t.Errorf("routes_pending{other} = %v after the annotation was removed, want 0", got)
+	}
+}
+
+func TestPending_ClearsWhenTheRouteAppearsInRecords(t *testing.T) {
+	p, api, reg := pendingFixture(t)
+	api.routes = []cloudflare.HostnameRoute{
+		{ID: "id-foo", Hostname: "foo.private", TunnelID: tunnelA, Comment: "managed-by=external-dns/x"},
+	}
+
+	if _, err := p.Records(context.Background()); err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingOther); got != 0 {
+		t.Errorf("routes_pending{other} = %v once the route is ours, want 0", got)
+	}
+}
+
+// In dry run no create is attempted, so no conflict is ever observed and nothing is pending.
+func TestApplyChanges_DryRunNeverMarksPending(t *testing.T) {
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-foo", Hostname: "foo.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/other"},
+	}}
+	p, reg, _ := dryRunHarness(t, api, true)
+
+	if err := p.ApplyChanges(context.Background(), createPlan(p, "foo.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	for _, reason := range []string{"self", "other", "untagged", "unknown"} {
+		if got := pendingValue(t, reg, reason); got != 0 {
+			t.Errorf("routes_pending{%s} = %v in dry run, want 0", reason, got)
+		}
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": "create"}); got != 1 {
+		t.Errorf("dry_run_skipped_total{create} = %v, want 1", got)
+	}
+}
+
+// A failing list is counted per tunnel, on both the read and the delete path, so a tunnel whose
+// token scope was revoked is visible before anything else notices.
+func TestListErrorsAreCountedPerTunnel(t *testing.T) {
+	api := &fakeAPI{listErrFor: map[string]error{testTunnel: errors.New("boom")}}
+	p, reg, _ := dryRunHarness(t, api, false)
+
+	if _, err := p.Records(context.Background()); err == nil {
+		t.Fatal("Records should fail when a tunnel cannot be listed")
+	}
+	if err := p.ApplyChanges(context.Background(), &plan.Changes{
+		Delete: []*endpoint.Endpoint{endpoint.NewEndpoint("foo.private", endpoint.RecordTypeCNAME, "")},
+	}); err == nil {
+		t.Fatal("ApplyChanges should fail when the delete index cannot be built")
+	}
+	if got := metricValue(t, reg, "cfzt_provider_list_errors_total", map[string]string{"tunnel_id": testTunnel}); got != 2 {
+		t.Errorf("list_errors_total{%s} = %v, want 2", testTunnel, got)
+	}
 }

@@ -38,6 +38,24 @@ const (
 // value for api_requests_total, which counts Cloudflare calls only.
 const OpFragment = "fragment"
 
+// Reason label values for the routes_pending gauge: why a create was refused with "hostname
+// already routed" (Cloudflare error 1108) and is being retried on every reconcile.
+const (
+	// PendingSelf: the hostname is routed by THIS owner on a tunnel this instance does not list.
+	// Nothing will ever release it; the fix is a TUNNEL_DRAIN or TUNNEL_MAP entry.
+	PendingSelf = "self"
+	// PendingOther: another external-dns owner holds it. It clears when that owner releases it.
+	PendingOther = "other"
+	// PendingUntagged: a route with no owner tag (Terraform, hand-created) holds it.
+	PendingUntagged = "untagged"
+	// PendingUnknown: Cloudflare refused the create but no live route could be found, either
+	// because the token cannot see it or because it is mid-delete.
+	PendingUnknown = "unknown"
+)
+
+// pendingReasons lists every reason value, so SetRoutesPending can zero the ones with no hosts.
+var pendingReasons = []string{PendingSelf, PendingOther, PendingUntagged, PendingUnknown}
+
 // Metrics holds the provider's Prometheus collectors.
 type Metrics struct {
 	apiRequests    *prometheus.CounterVec
@@ -50,6 +68,8 @@ type Metrics struct {
 	dryRunSkipped  *prometheus.CounterVec
 	corednsWrites  *prometheus.CounterVec
 	corednsRewrite prometheus.Gauge
+	routesPending  *prometheus.GaugeVec
+	listErrors     *prometheus.CounterVec
 }
 
 // New builds the collectors (unregistered). Call MustRegister to attach them to a registry.
@@ -96,6 +116,14 @@ func New() *Metrics {
 			Namespace: namespace, Subsystem: subsystem, Name: "coredns_rewrites",
 			Help: "Rewrites present in the managed CoreDNS fragment key after the last write.",
 		}),
+		routesPending: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "routes_pending",
+			Help: "Hostnames whose create is refused as already routed and retried each reconcile, by reason.",
+		}, []string{"reason"}),
+		listErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "list_errors_total",
+			Help: "Failed attempts to list hostname routes, by tunnel id (\"account\" for an account-wide list).",
+		}, []string{"tunnel_id"}),
 	}
 }
 
@@ -112,6 +140,8 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.dryRunSkipped,
 		m.corednsWrites,
 		m.corednsRewrite,
+		m.routesPending,
+		m.listErrors,
 	)
 }
 
@@ -211,4 +241,25 @@ func (m *Metrics) DryRunSkipped(operation string) {
 		return
 	}
 	m.dryRunSkipped.WithLabelValues(operation).Inc()
+}
+
+// SetRoutesPending publishes how many hostnames are pending, by reason. Every known reason is
+// written on every call, so a reason with no hosts reads 0 rather than keeping a stale value —
+// that is what lets an alert on routes_pending > 0 clear once a handoff completes.
+func (m *Metrics) SetRoutesPending(counts map[string]int) {
+	if m == nil {
+		return
+	}
+	for _, reason := range pendingReasons {
+		m.routesPending.WithLabelValues(reason).Set(float64(counts[reason]))
+	}
+}
+
+// ListError records one failed attempt to list hostname routes for tunnelID. A drained tunnel
+// whose token scope was revoked early shows up here before it shows up anywhere else.
+func (m *Metrics) ListError(tunnelID string) {
+	if m == nil {
+		return
+	}
+	m.listErrors.WithLabelValues(tunnelID).Inc()
 }
