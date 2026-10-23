@@ -117,3 +117,52 @@ func TestMetrics_PendingAndListErrorNilIsNoop(t *testing.T) {
 	m.SetRoutesPending(map[string]int{PendingSelf: 1})
 	m.ListError("tunnel-a")
 }
+
+func TestMetrics_RetargetByTunnelAndOrphanCollectors(t *testing.T) {
+	m := New()
+	m.MustRegister(prometheus.NewRegistry())
+
+	m.RouteRetargeted()
+	m.RouteRetargeted()
+	if got := testutil.ToFloat64(m.routesRetarget); got != 2 {
+		t.Errorf("routes_retargeted_total = %v, want 2", got)
+	}
+
+	// Zeros must be published: a draining tunnel at 0 is the signal it can be retired.
+	m.SetRoutesByTunnel(map[string]int{"tunnel-a": 4, "tunnel-old": 0})
+	if got := testutil.ToFloat64(m.routesByTunnel.WithLabelValues("tunnel-a")); got != 4 {
+		t.Errorf("routes_by_tunnel{tunnel-a} = %v, want 4", got)
+	}
+	if got := testutil.CollectAndCount(m.routesByTunnel); got != 2 {
+		t.Errorf("routes_by_tunnel has %d series, want 2 (the zero included)", got)
+	}
+
+	m.SetRoutesUndesired(3)
+	m.SetRoutesOutOfFilter(2)
+	if got := testutil.ToFloat64(m.routesUndesired); got != 3 {
+		t.Errorf("routes_undesired = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(m.routesOutOfFilter); got != 2 {
+		t.Errorf("routes_out_of_filter = %v, want 2", got)
+	}
+	// Gauges must be able to fall, or they could never clear an alert.
+	m.SetRoutesUndesired(0)
+	if got := testutil.ToFloat64(m.routesUndesired); got != 0 {
+		t.Errorf("routes_undesired after clearing = %v, want 0", got)
+	}
+
+	m.CoreDNSPruned(2)
+	m.CoreDNSPruned(1)
+	if got := testutil.ToFloat64(m.corednsPruned); got != 3 {
+		t.Errorf("coredns_pruned_total = %v, want 3", got)
+	}
+}
+
+func TestMetrics_RetargetByTunnelAndOrphanNilIsNoop(t *testing.T) {
+	var m *Metrics
+	m.RouteRetargeted()
+	m.SetRoutesByTunnel(map[string]int{"tunnel-a": 1})
+	m.SetRoutesUndesired(1)
+	m.SetRoutesOutOfFilter(1)
+	m.CoreDNSPruned(1)
+}

@@ -881,6 +881,7 @@ func TestAdopt_DryRunSuppressesThePatch(t *testing.T) {
 type fakeFragment struct {
 	applies  []fragmentCall
 	err      error
+	loadErr  error
 	order    *[]string
 	rewrites map[string]string
 }
@@ -902,6 +903,18 @@ func (f *fakeFragment) ServiceTarget(resource string) (string, error) {
 		return "", fmt.Errorf("malformed resource %q", resource)
 	}
 	return name + "." + ns + ".svc.cluster.local", nil
+}
+
+// Load returns a copy of the rewrites, as the real Fragment does, so a caller cannot mutate state.
+func (f *fakeFragment) Load(_ context.Context) (map[string]string, error) {
+	if f.loadErr != nil {
+		return nil, f.loadErr
+	}
+	out := make(map[string]string, len(f.rewrites))
+	for h, t := range f.rewrites {
+		out[h] = t
+	}
+	return out, nil
 }
 
 func (f *fakeFragment) Apply(_ context.Context, add map[string]string, remove []string) (map[string]string, error) {
@@ -1982,5 +1995,277 @@ func TestRetarget_WithoutDrainTheCreateIsPendingBySelf(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "TUNNEL_DRAIN") {
 		t.Errorf("log should name TUNNEL_DRAIN; got:\n%s", logs.String())
+	}
+}
+
+// --- orphan visibility and CoreDNS prune ------------------------------------------------------
+
+// pruneProvider serves edns.woven from tunnelA with the CoreDNS leg on. A hostname elsewhere under
+// woven matches the domain filter but has no tunnel, which is what a domain that has left
+// TUNNEL_MAP looks like.
+func pruneProvider(t *testing.T, api routeAPI, frag FragmentWriter, prune, dryRun bool) (*Provider, *prometheus.Registry, *bytes.Buffer) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client: api, TunnelMap: map[string]string{"edns.woven": tunnelA},
+		OwnerID: "test", OwnershipStrict: true, CoreDNS: frag, CoreDNSPrune: prune, DryRun: dryRun,
+		DomainFilter: []string{"woven"}, Metrics: m, Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p, reg, &logs
+}
+
+const ownTag = "managed-by=external-dns/test"
+
+// reconcileOnce runs what ExternalDNS runs before planning: Records, then AdjustEndpoints.
+func reconcileOnce(t *testing.T, p *Provider, desired ...*endpoint.Endpoint) {
+	t.Helper()
+	if _, err := p.Records(context.Background()); err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if _, err := p.AdjustEndpoints(desired); err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+}
+
+// Prune removes exactly the entries that nothing owns, nothing wants, this instance is allowed to
+// manage, and whose domain it still serves. Every other entry is a way prune could do harm.
+func TestPrune_RemovesOnlyStaleResolvableEntries(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-owned", Hostname: "owned.edns.woven", TunnelID: tunnelA, Comment: ownTag},
+	}}
+	frag := &fakeFragment{rewrites: map[string]string{
+		"owned.edns.woven":    "a.apps.svc.cluster.local", // a live route this instance manages
+		"pending.edns.woven":  "b.apps.svc.cluster.local", // wanted, held by someone else
+		"wanted.edns.woven":   "c.apps.svc.cluster.local", // wanted, route not created yet
+		"outside.example.com": "d.apps.svc.cluster.local", // outside the domain filter
+		"gone.other.woven":    "e.apps.svc.cluster.local", // its domain has left the map
+		"stale.edns.woven":    "f.apps.svc.cluster.local", // nothing owns it, nothing wants it
+	}}
+	p, reg, _ := pruneProvider(t, api, frag, true, false)
+
+	reconcileOnce(t, p,
+		svcEndpoint("pending.edns.woven", "service/apps/b"),
+		svcEndpoint("wanted.edns.woven", "service/apps/c"))
+
+	if len(frag.applies) != 1 || len(frag.applies[0].remove) != 1 || frag.applies[0].remove[0] != "stale.edns.woven" {
+		t.Fatalf("fragment writes = %+v, want exactly one removal of stale.edns.woven", frag.applies)
+	}
+	if len(frag.applies[0].add) != 0 {
+		t.Errorf("prune must not add anything: %v", frag.applies[0].add)
+	}
+	for host := range frag.rewrites {
+		if host == "stale.edns.woven" {
+			t.Errorf("the stale rewrite survived")
+		}
+	}
+	if len(frag.rewrites) != 5 {
+		t.Errorf("rewrites = %v, want the five legitimate entries untouched", frag.rewrites)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_coredns_pruned_total", nil); got != 1 {
+		t.Errorf("coredns_pruned_total = %v, want 1", got)
+	}
+}
+
+// The leak that motivated prune: a host stays pending while another instance holds it, its
+// rewrite is staged, and then its annotation is removed. No route is ever created and no delete is
+// ever planned, so only prune can clear the rewrite.
+func TestPrune_ClearsAnAbandonedPendingClaim(t *testing.T) {
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-held", Hostname: "held.edns.woven", TunnelID: tunnelB, Comment: "managed-by=external-dns/other"},
+	}}
+	frag := &fakeFragment{}
+	p, _, _ := pruneProvider(t, api, frag, true, false)
+
+	if err := p.ApplyChanges(context.Background(), &plan.Changes{Create: []*endpoint.Endpoint{
+		svcEndpoint("held.edns.woven", "service/apps/held"),
+	}}); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if _, staged := frag.rewrites["held.edns.woven"]; !staged {
+		t.Fatal("the pending host's rewrite should be staged")
+	}
+
+	// Still wanted: it survives a reconcile.
+	reconcileOnce(t, p, svcEndpoint("held.edns.woven", "service/apps/held"))
+	if _, staged := frag.rewrites["held.edns.woven"]; !staged {
+		t.Fatal("prune removed a rewrite that is still wanted")
+	}
+
+	// The annotation is removed. Nothing owns it, nothing wants it.
+	reconcileOnce(t, p)
+	if _, staged := frag.rewrites["held.edns.woven"]; staged {
+		t.Error("the abandoned claim's rewrite was not pruned")
+	}
+}
+
+// A freshly started instance has seen no routes, so its owned set is empty. Pruning on that would
+// delete every rewrite that is not currently wanted.
+func TestPrune_SkipsBeforeTheFirstRecords(t *testing.T) {
+	frag := &fakeFragment{rewrites: map[string]string{"stale.edns.woven": "x.apps.svc.cluster.local"}}
+	p, _, _ := pruneProvider(t, &fakeAPI{}, frag, true, false)
+
+	if _, err := p.AdjustEndpoints(nil); err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+	if len(frag.applies) != 0 {
+		t.Fatalf("pruned before any complete Records: %+v", frag.applies)
+	}
+}
+
+// A failed Records leaves the owned snapshot incomplete, and prune must not act on it even though
+// an earlier Records succeeded.
+func TestPrune_SkipsAfterARecordsFailure(t *testing.T) {
+	api := &fakeAPI{}
+	frag := &fakeFragment{rewrites: map[string]string{"stale.edns.woven": "x.apps.svc.cluster.local"}}
+	p, _, _ := pruneProvider(t, api, frag, true, false)
+
+	if _, err := p.Records(context.Background()); err != nil {
+		t.Fatalf("first Records: %v", err)
+	}
+	api.listErrFor = map[string]error{tunnelA: errors.New("cloudflare unavailable")}
+	if _, err := p.Records(context.Background()); err == nil {
+		t.Fatal("the second Records should fail")
+	}
+	if _, err := p.AdjustEndpoints(nil); err != nil {
+		t.Fatalf("AdjustEndpoints: %v", err)
+	}
+	if len(frag.applies) != 0 {
+		t.Fatalf("pruned on an incomplete snapshot: %+v", frag.applies)
+	}
+}
+
+func TestPrune_DisabledByConfig(t *testing.T) {
+	frag := &fakeFragment{rewrites: map[string]string{"stale.edns.woven": "x.apps.svc.cluster.local"}}
+	p, _, _ := pruneProvider(t, &fakeAPI{}, frag, false, false)
+
+	reconcileOnce(t, p)
+	if len(frag.applies) != 0 {
+		t.Fatalf("pruned although COREDNS_PRUNE is off: %+v", frag.applies)
+	}
+}
+
+func TestPrune_DryRunSuppressesTheWrite(t *testing.T) {
+	frag := &fakeFragment{rewrites: map[string]string{"stale.edns.woven": "x.apps.svc.cluster.local"}}
+	p, reg, logs := pruneProvider(t, &fakeAPI{}, frag, true, true)
+
+	reconcileOnce(t, p)
+	if len(frag.applies) != 0 {
+		t.Fatalf("dry run wrote the fragment: %+v", frag.applies)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": "prune"}); got != 1 {
+		t.Errorf("dry_run_skipped_total{prune} = %v, want 1", got)
+	}
+	if !strings.Contains(logs.String(), "would PRUNE") {
+		t.Errorf("dry run should report the intended prune; got:\n%s", logs.String())
+	}
+}
+
+// Prune is housekeeping. If the ConfigMap cannot be read or written, routes must still be
+// reconciled, so neither failure may fail AdjustEndpoints.
+func TestPrune_FailuresDoNotFailAdjustEndpoints(t *testing.T) {
+	t.Run("read", func(t *testing.T) {
+		frag := &fakeFragment{loadErr: errors.New("get configmap: forbidden")}
+		p, _, logs := pruneProvider(t, &fakeAPI{}, frag, true, false)
+		reconcileOnce(t, p)
+		if !strings.Contains(logs.String(), "prune skipped") {
+			t.Errorf("a failed read should be logged; got:\n%s", logs.String())
+		}
+	})
+	t.Run("write", func(t *testing.T) {
+		frag := &fakeFragment{
+			rewrites: map[string]string{"stale.edns.woven": "x.apps.svc.cluster.local"},
+			err:      errors.New("configmap conflict"),
+		}
+		p, reg, _ := pruneProvider(t, &fakeAPI{}, frag, true, false)
+		reconcileOnce(t, p)
+		if got := metricValue(t, reg, "cfzt_provider_coredns_writes_total", map[string]string{"result": "error"}); got != 1 {
+			t.Errorf("coredns_writes_total{error} = %v, want 1", got)
+		}
+		if got := metricValue(t, reg, "cfzt_provider_coredns_pruned_total", nil); got != 0 {
+			t.Errorf("coredns_pruned_total = %v after a failed write, want 0", got)
+		}
+	})
+}
+
+// Routes this instance owns but will never retarget or delete, because they sit outside the domain
+// filter, are counted; another owner's route is not this instance's to report.
+func TestRecords_OutOfFilterGauge(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "1", Hostname: "in.edns.woven", TunnelID: tunnelA, Comment: ownTag},
+		{ID: "2", Hostname: "out1.example.com", TunnelID: tunnelA, Comment: ownTag},
+		{ID: "3", Hostname: "out2.example.com", TunnelID: tunnelA, Comment: ownTag},
+		{ID: "4", Hostname: "theirs.example.com", TunnelID: tunnelA, Comment: "managed-by=external-dns/other"},
+	}}
+	p, reg, logs := pruneProvider(t, api, nil, false, false)
+
+	if _, err := p.Records(context.Background()); err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_out_of_filter", nil); got != 2 {
+		t.Errorf("routes_out_of_filter = %v, want 2", got)
+	}
+	if out := logs.String(); !strings.Contains(out, "out1.example.com") || strings.Contains(out, "theirs.example.com") {
+		t.Errorf("the log should name the owned out-of-filter hosts and no one else's; got:\n%s", out)
+	}
+}
+
+// Owned routes that no Service desires any more are counted, and the hostnames are logged once per
+// change rather than every reconcile.
+func TestAdjustEndpoints_UndesiredGauge(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "1", Hostname: "keep.edns.woven", TunnelID: tunnelA, Comment: ownTag},
+		{ID: "2", Hostname: "drop1.edns.woven", TunnelID: tunnelA, Comment: ownTag},
+		{ID: "3", Hostname: "drop2.edns.woven", TunnelID: tunnelA, Comment: ownTag},
+	}}
+	frag := &fakeFragment{rewrites: map[string]string{"keep.edns.woven": "k.apps.svc.cluster.local"}}
+	p, reg, logs := pruneProvider(t, api, frag, false, false)
+
+	keep := svcEndpoint("keep.edns.woven", "service/apps/k")
+	reconcileOnce(t, p, keep)
+	if got := metricValue(t, reg, "cfzt_provider_routes_undesired", nil); got != 2 {
+		t.Errorf("routes_undesired = %v, want 2", got)
+	}
+	reconcileOnce(t, p, keep)
+	if n := strings.Count(logs.String(), "no longer desired"); n != 1 {
+		t.Errorf("the undesired hosts were logged %d times over two reconciles, want once", n)
+	}
+	if !strings.Contains(logs.String(), "drop1.edns.woven") {
+		t.Errorf("the log should name the undesired hosts; got:\n%s", logs.String())
+	}
+
+	// Once everything is desired again the gauge returns to zero.
+	reconcileOnce(t, p, keep, svcEndpoint("drop1.edns.woven", "service/apps/d1"), svcEndpoint("drop2.edns.woven", "service/apps/d2"))
+	if got := metricValue(t, reg, "cfzt_provider_routes_undesired", nil); got != 0 {
+		t.Errorf("routes_undesired = %v after all hosts were desired again, want 0", got)
+	}
+}
+
+// In single-tunnel mode the resolver accepts every hostname, so the domain filter is the only
+// thing keeping prune away from a name this instance was never configured to manage.
+func TestPrune_LeavesHostsOutsideTheDomainFilterAlone(t *testing.T) {
+	frag := &fakeFragment{rewrites: map[string]string{
+		"outside.example.com": "a.apps.svc.cluster.local",
+		"stale.edns.woven":    "b.apps.svc.cluster.local",
+	}}
+	p, err := New(Config{
+		Client: &fakeAPI{}, TunnelID: tunnelA, OwnerID: "test", OwnershipStrict: true,
+		CoreDNS: frag, CoreDNSPrune: true, DomainFilter: []string{"woven"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	reconcileOnce(t, p)
+	if _, ok := frag.rewrites["outside.example.com"]; !ok {
+		t.Error("prune removed a rewrite outside the domain filter")
+	}
+	if _, ok := frag.rewrites["stale.edns.woven"]; ok {
+		t.Error("the stale in-filter rewrite should have been pruned")
 	}
 }
