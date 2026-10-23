@@ -62,6 +62,7 @@ func main() {
 	ownershipStrict := envBool("OWNERSHIP_STRICT", true)
 	dryRun := envBool("DRY_RUN", false)
 	adoptUntagged := envBool("ADOPT_UNTAGGED", false)
+	tunnelDrain := splitCSV(os.Getenv("TUNNEL_DRAIN"))
 	domainFilter := splitCSV(os.Getenv("DOMAIN_FILTER"))
 	webhookListen := envOr("WEBHOOK_LISTEN", "127.0.0.1:8888")
 	healthListen := envOr("HEALTH_LISTEN", "0.0.0.0:8080")
@@ -83,6 +84,7 @@ func main() {
 		Client:          client,
 		TunnelID:        tunnelID,
 		TunnelMap:       tunnelMap,
+		TunnelDrain:     tunnelDrain,
 		OwnerID:         ownerID,
 		OwnershipStrict: ownershipStrict,
 		DryRun:          dryRun,
@@ -101,7 +103,7 @@ func main() {
 
 	log.Info("starting webhook provider",
 		"webhook", webhookListen, "health", healthListen,
-		"tunnel_id", tunnelID, "tunnel_map", tunnelMap, "account_id", accountID,
+		"tunnel_id", tunnelID, "tunnel_map", tunnelMap, "tunnel_drain", tunnelDrain, "account_id", accountID,
 		"owner_id", ownerID, "ownership_strict", ownershipStrict, "dry_run", dryRun,
 		"adopt_untagged", adoptUntagged, "domain_filter", domainFilter,
 		"coredns_configmap", envOr("COREDNS_CONFIGMAP", ""))

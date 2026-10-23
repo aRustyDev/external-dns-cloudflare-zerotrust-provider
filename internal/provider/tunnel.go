@@ -29,9 +29,15 @@ const tunnelTargetSuffix = ".cfargotunnel.com"
 // to the one tunnel. Multi-tunnel mode: entries hold domain->tunnel bindings and a
 // hostname resolves to the entry with the longest matching domain suffix (most specific
 // wins), e.g. "a.apps.private" prefers "apps.private" over "private".
+//
+// A resolver may also carry DRAIN tunnels: tunnels this instance still lists, and deletes from,
+// but never resolves a hostname to. They exist so a tunnel can be retired without orphaning the
+// routes on it: while it drains, Records still sees those routes, so the plan can retarget or
+// delete them. resolve never returns a drain tunnel.
 type tunnelResolver struct {
 	entries  []tunnelEntry // sorted longest-domain-first
 	fallback string        // single-tunnel id; "" when a map is configured
+	drain    []string      // listed, never a create target
 }
 
 type tunnelEntry struct {
@@ -99,8 +105,42 @@ func (r *tunnelResolver) targetFor(hostname string) (string, bool) {
 	return r.target(tid), true
 }
 
-// tunnels returns the distinct tunnel IDs this resolver manages.
+// setDrain records the draining tunnels. A tunnel that is also configured is refused: it would be
+// a create target and a retirement candidate at once, and the operator almost certainly meant one.
+// Blank and repeated ids are ignored.
+func (r *tunnelResolver) setDrain(ids []string) error {
+	configured := map[string]struct{}{}
+	for _, tid := range r.configured() {
+		configured[tid] = struct{}{}
+	}
+	seen := map[string]struct{}{}
+	var drain []string
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := configured[id]; ok {
+			return fmt.Errorf("tunnel %q is both configured and draining: a draining tunnel is never "+
+				"a create target, so remove it from the tunnel configuration or from TUNNEL_DRAIN", id)
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		drain = append(drain, id)
+	}
+	r.drain = drain
+	return nil
+}
+
+// tunnels returns every tunnel ID this resolver lists: the configured ones, then the draining ones.
 func (r *tunnelResolver) tunnels() []string {
+	return append(r.configured(), r.drain...)
+}
+
+// configured returns the distinct tunnel IDs a hostname can resolve to.
+func (r *tunnelResolver) configured() []string {
 	if r.fallback != "" {
 		return []string{r.fallback}
 	}

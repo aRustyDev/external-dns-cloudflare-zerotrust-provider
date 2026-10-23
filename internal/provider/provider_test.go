@@ -51,6 +51,11 @@ type fakeAPI struct {
 	createErrFor map[string]error
 	// listErrFor fails the list of one tunnel id; the key "" is the account-wide list.
 	listErrFor map[string]error
+	// retargeted and retargetedTo record each PatchHostnameRoute call (route id, new tunnel).
+	retargeted   []string
+	retargetedTo []string
+	// patchRouteErr fails PatchHostnameRoute; clear it to let a retry succeed.
+	patchRouteErr error
 	// enforce makes the fake behave like Cloudflare: a create for a hostname that already has a
 	// live route is refused with 409 / 1108, and a delete really removes the route. Off by default
 	// so older tests keep their simple record-only semantics.
@@ -118,6 +123,30 @@ func (f *fakeAPI) PatchHostnameRouteComment(_ context.Context, id, comment strin
 			r := f.routes[i]
 			return &r, nil
 		}
+	}
+	return nil, fmt.Errorf("no such route %q", id)
+}
+
+// PatchHostnameRoute mirrors the retarget the live API is expected to perform: the route keeps its
+// id and hostname and moves to the new tunnel, keeping its comment unless one is supplied.
+func (f *fakeAPI) PatchHostnameRoute(_ context.Context, id string, patch cloudflare.RoutePatch) (*cloudflare.HostnameRoute, error) {
+	if f.patchRouteErr != nil {
+		return nil, f.patchRouteErr
+	}
+	for i := range f.routes {
+		if f.routes[i].ID != id {
+			continue
+		}
+		if patch.TunnelID != "" {
+			f.routes[i].TunnelID = patch.TunnelID
+		}
+		if patch.Comment != "" {
+			f.routes[i].Comment = patch.Comment
+		}
+		f.retargeted = append(f.retargeted, id)
+		f.retargetedTo = append(f.retargetedTo, patch.TunnelID)
+		r := f.routes[i]
+		return &r, nil
 	}
 	return nil, fmt.Errorf("no such route %q", id)
 }
@@ -1403,8 +1432,8 @@ func TestApplyChanges_409BySelfOnUnlistedTunnel(t *testing.T) {
 	if got := pendingValue(t, reg, metrics.PendingSelf); got != 1 {
 		t.Errorf("routes_pending{self} = %v, want 1", got)
 	}
-	if !strings.Contains(logs.String(), "TUNNEL_MAP") {
-		t.Errorf("log should name listing the tunnel as the fix; got:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "TUNNEL_DRAIN") {
+		t.Errorf("log should name TUNNEL_DRAIN as the fix; got:\n%s", logs.String())
 	}
 }
 
@@ -1622,5 +1651,336 @@ func TestListErrorsAreCountedPerTunnel(t *testing.T) {
 	}
 	if got := metricValue(t, reg, "cfzt_provider_list_errors_total", map[string]string{"tunnel_id": testTunnel}); got != 2 {
 		t.Errorf("list_errors_total{%s} = %v, want 2", testTunnel, got)
+	}
+}
+
+// --- retarget and drain ----------------------------------------------------------------------
+
+const tunnelD = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+// drainProvider serves apps.private from tunnelA and lists tunnelB as draining, so a route still
+// on tunnelB is visible to Records and is retargeted to tunnelA when the plan asks for it.
+func drainProvider(t *testing.T, api routeAPI, dryRun bool) (*Provider, *prometheus.Registry, *bytes.Buffer) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client: api, TunnelMap: map[string]string{"apps.private": tunnelA}, TunnelDrain: []string{tunnelB},
+		OwnerID: "test", OwnershipStrict: true, DryRun: dryRun, DomainFilter: []string{"private"},
+		Metrics: m, Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p, reg, &logs
+}
+
+// updatePlan is a plan whose only change is an Update for each host.
+func updatePlan(hosts ...string) *plan.Changes {
+	c := &plan.Changes{}
+	for _, h := range hosts {
+		c.UpdateNew = append(c.UpdateNew, endpoint.NewEndpoint(h, endpoint.RecordTypeCNAME, tunnelA+".cfargotunnel.com"))
+	}
+	return c
+}
+
+// seriesExists reports whether the registry holds a sample with exactly this label set. metricValue
+// cannot tell a series at 0 from a missing one, and for routes_by_tunnel that difference matters.
+func seriesExists(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) bool {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			got := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				got[lp.GetName()] = lp.GetValue()
+			}
+			match := len(got) == len(labels)
+			for k, v := range labels {
+				if got[k] != v {
+					match = false
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// An Update is a retarget: the route is moved in place, so it keeps its id, and nothing is created
+// or deleted. A plan with ONLY updates must still reach the retarget (it used to return early).
+func TestApplyChanges_UpdateRetargetsOwnedRoute(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-x", Hostname: "x.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+	}}
+	p, reg, _ := drainProvider(t, api, false)
+
+	if err := p.ApplyChanges(context.Background(), updatePlan("x.apps.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.retargeted) != 1 || api.retargeted[0] != "id-x" || api.retargetedTo[0] != tunnelA {
+		t.Fatalf("retargeted = %v to %v, want [id-x] to [%s]", api.retargeted, api.retargetedTo, tunnelA)
+	}
+	if len(api.created) != 0 || len(api.deleted) != 0 {
+		t.Errorf("a retarget must not create or delete: created=%v deleted=%v", api.created, api.deleted)
+	}
+	if r := api.routes[0]; r.ID != "id-x" || r.TunnelID != tunnelA || r.Comment != "managed-by=external-dns/test" {
+		t.Errorf("route = %+v, want the same id and comment on tunnel A", r)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_retargeted_total", nil); got != 1 {
+		t.Errorf("routes_retargeted_total = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_api_requests_total", map[string]string{"operation": "retarget", "result": "success"}); got != 1 {
+		t.Errorf("api_requests_total{retarget,success} = %v, want 1", got)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_routes_created_total", nil); got != 0 {
+		t.Errorf("routes_created_total = %v, want 0 (a retarget is not a create)", got)
+	}
+}
+
+// ExternalDNS also plans an Update for a TTL or label difference. A route already on the wanted
+// tunnel needs no write.
+func TestApplyChanges_UpdateNoOpWhenTunnelMatches(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-x", Hostname: "x.apps.private", TunnelID: tunnelA, Comment: "managed-by=external-dns/test"},
+	}}
+	p, _, _ := drainProvider(t, api, false)
+
+	if err := p.ApplyChanges(context.Background(), updatePlan("x.apps.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.retargeted) != 0 {
+		t.Errorf("a route already on the wanted tunnel must not be patched: %v", api.retargeted)
+	}
+}
+
+// A failed PATCH leaves the route where it was, so the plan emits the same Update next cycle and
+// the retry succeeds without any special recovery.
+func TestApplyChanges_UpdateFailureRetriesNextCycle(t *testing.T) {
+	api := &fakeAPI{
+		routes: []cloudflare.HostnameRoute{
+			{ID: "id-x", Hostname: "x.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+		},
+		patchRouteErr: errors.New("cloudflare is having a day"),
+	}
+	p, _, _ := drainProvider(t, api, false)
+
+	err := p.ApplyChanges(context.Background(), updatePlan("x.apps.private"))
+	if err == nil || !strings.Contains(err.Error(), "x.apps.private") {
+		t.Fatalf("want an error naming the host; got %v", err)
+	}
+	if api.routes[0].TunnelID != tunnelB {
+		t.Fatalf("a failed retarget must leave the route on its old tunnel, got %s", api.routes[0].TunnelID)
+	}
+
+	api.patchRouteErr = nil
+	if err := p.ApplyChanges(context.Background(), updatePlan("x.apps.private")); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if api.routes[0].TunnelID != tunnelA {
+		t.Errorf("after the retry the route is on %s, want tunnel A", api.routes[0].TunnelID)
+	}
+}
+
+// One failing retarget must not stop the others.
+func TestApplyChanges_UpdateFailureDoesNotBlockOtherHosts(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-a", Hostname: "a.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+		{ID: "id-b", Hostname: "b.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+	}}
+	p, _, _ := drainProvider(t, api, false)
+	failing := &failOnceAPI{fakeAPI: api, failID: "id-a"}
+	p.client = failing
+
+	err := p.ApplyChanges(context.Background(), updatePlan("a.apps.private", "b.apps.private"))
+	if err == nil || !strings.Contains(err.Error(), "a.apps.private") {
+		t.Fatalf("want the failure of a.apps.private; got %v", err)
+	}
+	if api.routes[1].TunnelID != tunnelA {
+		t.Errorf("b.apps.private = %s, want it retargeted despite a's failure", api.routes[1].TunnelID)
+	}
+}
+
+// failOnceAPI fails the retarget of one route id and delegates everything else.
+type failOnceAPI struct {
+	*fakeAPI
+	failID string
+}
+
+func (f *failOnceAPI) PatchHostnameRoute(ctx context.Context, id string, patch cloudflare.RoutePatch) (*cloudflare.HostnameRoute, error) {
+	if id == f.failID {
+		return nil, errors.New("boom")
+	}
+	return f.fakeAPI.PatchHostnameRoute(ctx, id, patch)
+}
+
+// Only routes this instance may manage are ever retargeted.
+func TestApplyChanges_UpdateIgnoresForeignRoute(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-x", Hostname: "x.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/other"},
+	}}
+	p, _, _ := drainProvider(t, api, false)
+
+	if err := p.ApplyChanges(context.Background(), updatePlan("x.apps.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.retargeted) != 0 {
+		t.Errorf("retargeted another owner's route: %v", api.retargeted)
+	}
+}
+
+func TestApplyChanges_UpdateDryRunSuppressesTheRetarget(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-x", Hostname: "x.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+	}}
+	p, reg, logs := drainProvider(t, api, true)
+
+	if err := p.ApplyChanges(context.Background(), updatePlan("x.apps.private")); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if len(api.retargeted) != 0 || api.routes[0].TunnelID != tunnelB {
+		t.Fatalf("dry run must not retarget: %v, route on %s", api.retargeted, api.routes[0].TunnelID)
+	}
+	if got := metricValue(t, reg, "cfzt_provider_dry_run_skipped_total", map[string]string{"operation": "retarget"}); got != 1 {
+		t.Errorf("dry_run_skipped_total{retarget} = %v, want 1", got)
+	}
+	if !strings.Contains(logs.String(), "would RETARGET") {
+		t.Errorf("dry run should report the intended retarget; got:\n%s", logs.String())
+	}
+}
+
+func TestNew_RefusesATunnelThatIsBothConfiguredAndDraining(t *testing.T) {
+	_, err := New(Config{Client: &fakeAPI{}, TunnelID: tunnelA, TunnelDrain: []string{tunnelA}})
+	if err == nil {
+		t.Fatal("want an error when the configured tunnel is also draining")
+	}
+}
+
+// Draining tunnels are listed, and counted including zeros. A draining tunnel reading 0 is the
+// signal it can be removed from the configuration, and an absent series would read as unknown.
+func TestRecords_RoutesByTunnelIncludesDrainAndZeros(t *testing.T) {
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "1", Hostname: "a.apps.private", TunnelID: tunnelA, Comment: "managed-by=external-dns/test"},
+		{ID: "2", Hostname: "old.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+		// Out of the domain filter, but still stranded on the draining tunnel.
+		{ID: "3", Hostname: "elsewhere.example.com", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+		// Another owner's route is not this instance's to retire.
+		{ID: "4", Hostname: "theirs.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/other"},
+	}}
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	p, err := New(Config{
+		Client: api, TunnelMap: map[string]string{"apps.private": tunnelA},
+		TunnelDrain: []string{tunnelB, tunnelD}, OwnerID: "test", OwnershipStrict: true,
+		DomainFilter: []string{"private"}, Metrics: m,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	eps, err := p.Records(context.Background())
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if len(eps) != 2 {
+		t.Fatalf("Records = %v, want the two in-filter routes", names(eps))
+	}
+	for tunnel, want := range map[string]float64{tunnelA: 1, tunnelB: 2, tunnelD: 0} {
+		labels := map[string]string{"tunnel_id": tunnel}
+		if !seriesExists(t, reg, "cfzt_provider_routes_by_tunnel", labels) {
+			t.Errorf("routes_by_tunnel{%s} is missing; every listed tunnel must be present", tunnel)
+		}
+		if got := metricValue(t, reg, "cfzt_provider_routes_by_tunnel", labels); got != want {
+			t.Errorf("routes_by_tunnel{%s} = %v, want %v", tunnel, got, want)
+		}
+	}
+}
+
+// The whole path, with ExternalDNS's real planner in the middle: a route sitting on the draining
+// tunnel is reported by Records, canonicalised by AdjustEndpoints to the configured tunnel's
+// target, planned as an Update, and moved by ApplyChanges. The next reconcile plans nothing.
+func TestRetarget_EndToEndThroughTheRealPlanner(t *testing.T) {
+	ctx := context.Background()
+	api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+		{ID: "id-x", Hostname: "x.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+	}}
+	p, _, _ := drainProvider(t, api, false)
+
+	reconcile := func() *plan.Changes {
+		t.Helper()
+		current, err := p.Records(ctx)
+		if err != nil {
+			t.Fatalf("Records: %v", err)
+		}
+		source := []*endpoint.Endpoint{endpoint.NewEndpoint("x.apps.private", endpoint.RecordTypeA, "10.0.0.5")}
+		desired, err := p.AdjustEndpoints(source)
+		if err != nil {
+			t.Fatalf("AdjustEndpoints: %v", err)
+		}
+		calculated := (&plan.Plan{
+			Policies:       []plan.Policy{&plan.SyncPolicy{}},
+			Current:        current,
+			Desired:        desired,
+			ManagedRecords: []string{endpoint.RecordTypeCNAME},
+		}).Calculate()
+		if calculated.Changes.HasChanges() {
+			if err := p.ApplyChanges(ctx, calculated.Changes); err != nil {
+				t.Fatalf("ApplyChanges: %v", err)
+			}
+		}
+		return calculated.Changes
+	}
+
+	first := reconcile()
+	if len(first.UpdateNew) != 1 || len(first.Create) != 0 || len(first.Delete) != 0 {
+		t.Fatalf("first plan = %d create / %d update / %d delete, want exactly one update",
+			len(first.Create), len(first.UpdateNew), len(first.Delete))
+	}
+	if r := api.routes[0]; r.ID != "id-x" || r.TunnelID != tunnelA {
+		t.Fatalf("route = %+v, want the same id on tunnel A", r)
+	}
+	if second := reconcile(); second.HasChanges() {
+		t.Errorf("the second reconcile should plan nothing, got %+v", second)
+	}
+}
+
+// With the old tunnel NOT draining the route is invisible, so the plan re-creates the host and the
+// create is refused as this owner's own route. It is reported as self, naming TUNNEL_DRAIN.
+func TestRetarget_WithoutDrainTheCreateIsPendingBySelf(t *testing.T) {
+	api := &fakeAPI{enforce: true, routes: []cloudflare.HostnameRoute{
+		{ID: "id-x", Hostname: "x.apps.private", TunnelID: tunnelB, Comment: "managed-by=external-dns/test"},
+	}}
+	reg := prometheus.NewRegistry()
+	m := metrics.New()
+	m.MustRegister(reg)
+	var logs bytes.Buffer
+	p, err := New(Config{
+		Client: api, TunnelMap: map[string]string{"apps.private": tunnelA}, // tunnelB is not listed
+		OwnerID: "test", OwnershipStrict: true, DomainFilter: []string{"private"},
+		Metrics: m, Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := p.ApplyChanges(context.Background(), cnamePlan([]string{"x.apps.private"}, nil)); err != nil {
+		t.Fatalf("ApplyChanges: %v", err)
+	}
+	if got := pendingValue(t, reg, metrics.PendingSelf); got != 1 {
+		t.Errorf("routes_pending{self} = %v, want 1", got)
+	}
+	if !strings.Contains(logs.String(), "TUNNEL_DRAIN") {
+		t.Errorf("log should name TUNNEL_DRAIN; got:\n%s", logs.String())
 	}
 }
