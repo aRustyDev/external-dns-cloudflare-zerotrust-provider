@@ -15,6 +15,9 @@
 // Command webhook runs the ExternalDNS webhook provider for Cloudflare Zero Trust
 // hostname routes. It is meant to run as a sidecar to the stock ExternalDNS container,
 // which is launched with `--provider=webhook`.
+//
+// `webhook prune --owner <id>` instead runs a one-shot cleanup of a dead owner's routes; see
+// prune.go.
 package main
 
 import (
@@ -43,6 +46,17 @@ import (
 const defaultOwnerID = "default"
 
 func main() {
+	// `webhook prune` is a one-shot cleanup tool, not the server. Dispatch before any server
+	// configuration is read, so it needs only the Cloudflare credentials.
+	if len(os.Args) > 1 && os.Args[1] == "prune" {
+		os.Exit(runPrune(os.Args[2:], pruneDeps{
+			getenv:    os.Getenv,
+			newClient: func(accountID, apiToken string) pruneClient { return cloudflare.New(accountID, apiToken) },
+			stdout:    os.Stdout,
+			stderr:    os.Stderr,
+		}))
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 	accountID := mustEnv(log, "CF_ACCOUNT_ID")
