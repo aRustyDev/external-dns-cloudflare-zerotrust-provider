@@ -102,6 +102,10 @@ level=INFO msg="dry run: would CREATE hostname route" hostname=foo.private tunne
 level=INFO msg="dry run: would DELETE hostname route" hostname=old.private route_id=…
 ```
 
+A dry run never attempts a create, so it cannot observe Cloudflare refusing one. A hostname that
+another owner holds is therefore **not** reported as pending (see
+[Multiple instances](#multiple-instances)) until `DRY_RUN` is off.
+
 Two metrics keep a dry-run deployment honest in **both** directions — the risk is not only
 "I thought it was inert and it wasn't", but also "it has been inert for a month and nobody
 noticed":
