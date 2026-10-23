@@ -29,7 +29,8 @@
 // Ownership: routes are tagged with a "managed-by=external-dns/<owner>" comment. In
 // ownership-strict mode the provider only ever reads back and deletes routes carrying its own
 // owner tag, so it cannot disturb routes created by Terraform or by hand — important where an
-// external system (e.g. Terraform) is the declared sole owner of some `.private` routes.
+// external system (e.g. Terraform) is the declared sole owner of some `.private` routes. In every
+// mode it leaves routes tagged by a DIFFERENT owner alone.
 //
 // Dry run: ExternalDNS's own --dry-run flag is silently INERT for webhook providers (see
 // docs/upstream-dry-run-gap.md), so this provider implements its own DryRun, which is the only
@@ -214,8 +215,23 @@ func (p *Provider) owns(r cloudflare.HostnameRoute) bool {
 	return managed && owner == p.ownerID
 }
 
+// manageable reports whether this instance may read back, delete or retarget the route.
+//
+// A route tagged by ANOTHER external-dns owner is never manageable, in any mode: that tag is the
+// only record of who created it, and acting on it would let one instance delete a sibling's
+// routes. A route carrying no tag at all (Terraform, hand-created) is manageable only when
+// ownership-strict mode is off. Our own tag is always manageable. This mirrors adopt(), which
+// refuses to claim another owner's route for the same reason.
+func (p *Provider) manageable(r cloudflare.HostnameRoute) bool {
+	owner, managed := routeOwner(r.Comment)
+	if managed {
+		return owner == p.ownerID
+	}
+	return !p.ownershipStrict
+}
+
 // Records lists managed hostname routes across the configured tunnel(s) as CNAME endpoints.
-// It filters by domain filter and, in ownership-strict mode, by owner tag.
+// It filters by domain filter and by ownership (see manageable).
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	var out []*endpoint.Endpoint
 	for _, tid := range p.resolver.tunnels() {
@@ -232,7 +248,7 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 			if !p.domainFilter.Match(r.Hostname) {
 				continue
 			}
-			if p.ownershipStrict && !p.owns(r) {
+			if !p.manageable(r) {
 				continue
 			}
 			out = append(out, endpoint.NewEndpoint(r.Hostname, recordType, target))
@@ -436,8 +452,7 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 }
 
 // ownedRouteIndex lists every configured tunnel and returns the live routes this instance may
-// delete, keyed by lowercase hostname. In ownership-strict mode that is only routes carrying our
-// own owner tag. The value is the whole route, not just its id, so callers can also see which
+// delete, keyed by lowercase hostname (see manageable for what is eligible). The value is the whole route, not just its id, so callers can also see which
 // tunnel it is on.
 func (p *Provider) ownedRouteIndex(ctx context.Context) (map[string]cloudflare.HostnameRoute, error) {
 	index := map[string]cloudflare.HostnameRoute{}
@@ -451,7 +466,7 @@ func (p *Provider) ownedRouteIndex(ctx context.Context) (map[string]cloudflare.H
 			if r.DeletedAt != nil {
 				continue
 			}
-			if p.ownershipStrict && !p.owns(r) {
+			if !p.manageable(r) {
 				continue
 			}
 			index[strings.ToLower(r.Hostname)] = r

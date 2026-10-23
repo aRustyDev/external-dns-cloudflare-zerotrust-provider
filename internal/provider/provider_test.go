@@ -230,14 +230,85 @@ func TestOwnershipStrict_RecordsOnlyOwned(t *testing.T) {
 		t.Fatalf("strict Records = %v, want [mine.private]", names(eps))
 	}
 
-	// Non-strict: all domain-matching routes surface, regardless of owner.
+	// Non-strict: untagged routes surface too, but a route tagged by ANOTHER external-dns owner
+	// still does not. Tests before multi-instance support expected all 3 here.
 	loose := newTestProvider(t, api, "private")
 	eps, err = loose.Records(context.Background())
 	if err != nil {
 		t.Fatalf("Records: %v", err)
 	}
-	if len(eps) != 3 {
-		t.Fatalf("non-strict Records = %v, want all 3", names(eps))
+	if got := names(eps); len(got) != 2 || got[0] != "mine.private" || got[1] != "manual.private" {
+		t.Fatalf("non-strict Records = %v, want [mine.private manual.private]", got)
+	}
+}
+
+// The invariant behind multi-instance safety: a route tagged by a DIFFERENT external-dns owner is
+// invisible to this instance in every mode, so ExternalDNS can never plan to delete or recreate it.
+func TestRecords_NeverExposesAnotherOwner(t *testing.T) {
+	for _, strict := range []bool{true, false} {
+		api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+			{ID: "1", Hostname: "mine.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+			{ID: "2", Hostname: "theirs.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/other"},
+			{ID: "3", Hostname: "untagged.private", TunnelID: testTunnel, Comment: "hand-created"},
+		}}
+		p, err := New(Config{Client: api, TunnelID: testTunnel, OwnerID: "test", OwnershipStrict: strict, DomainFilter: []string{"private"}})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		eps, err := p.Records(context.Background())
+		if err != nil {
+			t.Fatalf("Records: %v", err)
+		}
+		got := map[string]bool{}
+		for _, n := range names(eps) {
+			got[n] = true
+		}
+		if got["theirs.private"] {
+			t.Errorf("strict=%v: another owner's route was exposed: %v", strict, names(eps))
+		}
+		if !got["mine.private"] {
+			t.Errorf("strict=%v: own route missing: %v", strict, names(eps))
+		}
+		if got["untagged.private"] != !strict {
+			t.Errorf("strict=%v: untagged route visible=%v, want %v", strict, got["untagged.private"], !strict)
+		}
+	}
+}
+
+// Same invariant on the delete path: asking to delete a sibling's route is a no-op in every mode.
+func TestIndex_NeverDeletesAnotherOwner(t *testing.T) {
+	for _, strict := range []bool{true, false} {
+		api := &fakeAPI{routes: []cloudflare.HostnameRoute{
+			{ID: "id-mine.private", Hostname: "mine.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/test"},
+			{ID: "id-theirs.private", Hostname: "theirs.private", TunnelID: testTunnel, Comment: "managed-by=external-dns/other"},
+			{ID: "id-untagged.private", Hostname: "untagged.private", TunnelID: testTunnel, Comment: "hand-created"},
+		}}
+		p, err := New(Config{Client: api, TunnelID: testTunnel, OwnerID: "test", OwnershipStrict: strict, DomainFilter: []string{"private"}})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		target := p.resolver.target(testTunnel)
+		changes := &plan.Changes{Delete: []*endpoint.Endpoint{
+			endpoint.NewEndpoint("mine.private", endpoint.RecordTypeCNAME, target),
+			endpoint.NewEndpoint("theirs.private", endpoint.RecordTypeCNAME, target),
+			endpoint.NewEndpoint("untagged.private", endpoint.RecordTypeCNAME, target),
+		}}
+		if err := p.ApplyChanges(context.Background(), changes); err != nil {
+			t.Fatalf("ApplyChanges: %v", err)
+		}
+		deleted := map[string]bool{}
+		for _, id := range api.deleted {
+			deleted[id] = true
+		}
+		if deleted["id-theirs.private"] {
+			t.Errorf("strict=%v: deleted another owner's route: %v", strict, api.deleted)
+		}
+		if !deleted["id-mine.private"] {
+			t.Errorf("strict=%v: own route not deleted: %v", strict, api.deleted)
+		}
+		if deleted["id-untagged.private"] != !strict {
+			t.Errorf("strict=%v: untagged route deleted=%v, want %v", strict, deleted["id-untagged.private"], !strict)
+		}
 	}
 }
 
