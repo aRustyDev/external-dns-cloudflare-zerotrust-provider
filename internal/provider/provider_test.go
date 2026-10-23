@@ -2269,3 +2269,29 @@ func TestPrune_LeavesHostsOutsideTheDomainFilterAlone(t *testing.T) {
 		t.Error("the stale in-filter rewrite should have been pruned")
 	}
 }
+
+// RouteTaggedBy is what the prune subcommand trusts to decide which routes are an owner's, so it
+// must be exact: another owner, a longer owner id, and no tag at all must all fail.
+func TestRouteTaggedBy(t *testing.T) {
+	cases := []struct {
+		comment, owner string
+		want           bool
+	}{
+		{"managed-by=external-dns/x", "x", true},
+		{"  managed-by=external-dns/x  ", "x", true},
+		{"managed-by=external-dns/x", "y", false},
+		{"managed-by=external-dns/x-prod", "x", false},
+		{"managed-by=external-dns/x", "x-prod", false},
+		{"managed-by=external-dns/x", "", false},
+		{"managed by opentofu", "x", false},
+		{"", "x", false},
+		// The untagged-owner form belongs to the empty owner, and to nobody else.
+		{"managed-by=external-dns", "", true},
+		{"managed-by=external-dns", "x", false},
+	}
+	for _, c := range cases {
+		if got := RouteTaggedBy(c.comment, c.owner); got != c.want {
+			t.Errorf("RouteTaggedBy(%q, %q) = %v, want %v", c.comment, c.owner, got, c.want)
+		}
+	}
+}

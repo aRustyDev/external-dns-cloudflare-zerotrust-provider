@@ -252,6 +252,14 @@ func routeOwner(comment string) (owner string, managed bool) {
 	return "", false
 }
 
+// RouteTaggedBy reports whether a route comment carries the managed-by tag of the given owner.
+// It exists so tools outside this package, such as the prune subcommand, never re-implement the
+// tag format and drift from it.
+func RouteTaggedBy(comment, owner string) bool {
+	o, managed := routeOwner(comment)
+	return managed && o == owner
+}
+
 // owns reports whether this provider instance owns the route (managed by us, our owner id).
 func (p *Provider) owns(r cloudflare.HostnameRoute) bool {
 	owner, managed := routeOwner(r.Comment)
