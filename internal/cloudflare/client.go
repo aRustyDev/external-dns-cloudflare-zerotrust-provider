@@ -21,6 +21,7 @@
 //	List   GET    /accounts/{account_id}/zerotrust/routes/hostname
 //	Create POST   /accounts/{account_id}/zerotrust/routes/hostname   {hostname, tunnel_id, comment}
 //	Patch  PATCH  /accounts/{account_id}/zerotrust/routes/hostname/{id}  {comment}
+//	             or {hostname, tunnel_id, comment} to retarget (see PatchHostnameRoute)
 //	Delete DELETE /accounts/{account_id}/zerotrust/routes/hostname/{id}
 //
 // It intentionally has no third-party dependencies so it stays trivially testable.
@@ -288,6 +289,36 @@ type patchRequest struct {
 // deliberately — it cannot accidentally retarget the hostname to a different tunnel.
 func (c *Client) PatchHostnameRouteComment(ctx context.Context, id, comment string) (*HostnameRoute, error) {
 	resp, err := c.do(ctx, http.MethodPatch, c.routesPath()+"/"+id, nil, patchRequest{Comment: comment})
+	if err != nil {
+		return nil, err
+	}
+	var route HostnameRoute
+	if err := json.Unmarshal(resp.Result, &route); err != nil {
+		return nil, fmt.Errorf("decode patched route: %w", err)
+	}
+	return &route, nil
+}
+
+// RoutePatch is the set of fields to change on an existing hostname route. A zero field is omitted
+// from the request, so only what is set is sent.
+type RoutePatch struct {
+	Hostname string `json:"hostname,omitempty"`
+	TunnelID string `json:"tunnel_id,omitempty"`
+	Comment  string `json:"comment,omitempty"`
+}
+
+// PatchHostnameRoute changes the named fields of an existing route in place and returns the
+// result. It is the retarget primitive: setting TunnelID moves the hostname to another tunnel
+// while the route keeps its id, so there is no create/delete race and no resolution gap.
+//
+// NOT YET VERIFIED LIVE: that the API retargets on PATCH, that the route id survives, and whether
+// tunnel_id may be sent without hostname. The documented full body is {hostname, tunnel_id,
+// comment}, so callers should send all three. test/integration TestLiveRetargetPreservesRouteID
+// settles it; until it has been run against a real account, treat a retarget as unproven.
+//
+// Use PatchHostnameRouteComment for adoption instead: it cannot express a retarget by accident.
+func (c *Client) PatchHostnameRoute(ctx context.Context, id string, patch RoutePatch) (*HostnameRoute, error) {
+	resp, err := c.do(ctx, http.MethodPatch, c.routesPath()+"/"+id, nil, patch)
 	if err != nil {
 		return nil, err
 	}
