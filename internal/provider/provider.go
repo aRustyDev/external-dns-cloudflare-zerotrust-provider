@@ -337,26 +337,15 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 	start := time.Now()
 	defer func() { p.metrics.ObserveApply(time.Since(start).Seconds()) }()
 
-	// Build hostname -> route-id from the live set once, for deletes. In ownership-strict mode
+	// Build hostname -> route from the live set once, for deletes. In ownership-strict mode
 	// only our own routes are eligible, so we never delete Terraform-owned / hand-created ones.
-	byHost := map[string]string{}
+	var index map[string]cloudflare.HostnameRoute
 	if len(changes.Delete) > 0 {
-		for _, tid := range p.resolver.tunnels() {
-			routes, err := p.client.ListHostnameRoutes(ctx, tid)
-			p.metrics.APIRequest(metrics.OpList, err)
-			if err != nil {
-				return fmt.Errorf("list routes for delete: %w", err)
-			}
-			for _, r := range routes {
-				if r.DeletedAt != nil {
-					continue
-				}
-				if p.ownershipStrict && !p.owns(r) {
-					continue
-				}
-				byHost[strings.ToLower(r.Hostname)] = r.ID
-			}
+		idx, err := p.ownedRouteIndex(ctx)
+		if err != nil {
+			return err
 		}
+		index = idx
 	}
 
 	// Adoption must see routes this instance does NOT own, so this index is built WITHOUT the
@@ -426,10 +415,11 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		if !p.domainFilter.Match(ep.DNSName) {
 			continue
 		}
-		id, ok := byHost[strings.ToLower(ep.DNSName)]
+		r, ok := index[strings.ToLower(ep.DNSName)]
 		if !ok {
 			continue // already gone, or not owned by us in strict mode
 		}
+		id := r.ID
 		if p.dryRun {
 			p.log.Info("dry run: would DELETE hostname route", "hostname", ep.DNSName, "route_id", id)
 			p.metrics.DryRunSkipped(metrics.OpDelete)
@@ -443,6 +433,31 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		p.metrics.RouteDeleted()
 	}
 	return nil
+}
+
+// ownedRouteIndex lists every configured tunnel and returns the live routes this instance may
+// delete, keyed by lowercase hostname. In ownership-strict mode that is only routes carrying our
+// own owner tag. The value is the whole route, not just its id, so callers can also see which
+// tunnel it is on.
+func (p *Provider) ownedRouteIndex(ctx context.Context) (map[string]cloudflare.HostnameRoute, error) {
+	index := map[string]cloudflare.HostnameRoute{}
+	for _, tid := range p.resolver.tunnels() {
+		routes, err := p.client.ListHostnameRoutes(ctx, tid)
+		p.metrics.APIRequest(metrics.OpList, err)
+		if err != nil {
+			return nil, fmt.Errorf("list routes for delete: %w", err)
+		}
+		for _, r := range routes {
+			if r.DeletedAt != nil {
+				continue
+			}
+			if p.ownershipStrict && !p.owns(r) {
+				continue
+			}
+			index[strings.ToLower(r.Hostname)] = r
+		}
+	}
+	return index, nil
 }
 
 // applyCoreDNS writes the in-cluster leg for this plan, in ONE server-side apply, BEFORE any
