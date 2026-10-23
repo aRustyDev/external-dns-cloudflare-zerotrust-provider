@@ -68,6 +68,7 @@ kubectl apply -f deploy/deployment.yaml
 | `CF_ACCOUNT_ID` | yes | — | Cloudflare account ID |
 | `CF_TUNNEL_ID` | conditional | — | Single-tunnel mode: tunnel the hostname routes bind to. Required unless `TUNNEL_MAP` is set |
 | `TUNNEL_MAP` | conditional | — | Multi-tunnel mode: `domain=tunnelID,...` (most-specific domain wins). Supersedes `CF_TUNNEL_ID` |
+| `TUNNEL_DRAIN` | no | — | Comma-separated tunnel IDs this instance still **lists and deletes from** but never creates on. Retire a tunnel by moving it here (see [Retiring a tunnel](#retiring-a-tunnel)). A tunnel may not also be configured |
 | `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`). **Must be unique per instance** in an account; the provider warns while it is still `default` (see [Multiple instances](#multiple-instances)) |
 | `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
 | `DRY_RUN` | no | `false` | Log intended route creates/deletes and make **no** mutating Cloudflare call (see [Dry run](#dry-run)) |
@@ -257,6 +258,45 @@ Each hostname is bound to the tunnel of its **longest matching domain suffix**, 
 `svc.apps.private` → `tunnel-a` and `other.private` → `tunnel-b`. A hostname matching no configured
 domain is skipped.
 
+### Moving a domain to another tunnel
+
+Change its entry in `TUNNEL_MAP`, and keep the **old** tunnel listed by adding it to
+`TUNNEL_DRAIN` in the same change. Every route for that domain is then retargeted **in place**: the
+route keeps its id and the hostname is never unrouted, so there is no create/delete race and no gap
+in resolution.
+
+```
+# before
+TUNNEL_MAP=apps.private=<tunnel-a>
+# after: apps.private now rides tunnel-b, and tunnel-a is kept visible so its routes can move
+TUNNEL_MAP=apps.private=<tunnel-b>
+TUNNEL_DRAIN=<tunnel-a>
+```
+
+`DRY_RUN=true` logs each intended retarget (`would RETARGET hostname route`) without making it.
+A failed retarget leaves the route where it was, and the next reconcile plans it again.
+
+> **Not yet verified against a live account:** that Cloudflare retargets on `PATCH` and keeps the
+> route id. `TestLiveRetargetPreservesRouteID` in `test/integration/` settles it. Run it before
+> relying on this in production.
+
+If you drop the old tunnel from the configuration *without* draining it, its routes are invisible
+to this instance, so the plan tries to create each host again on the new tunnel and Cloudflare
+refuses. They show up as `cfzt_provider_routes_pending{reason="self"}`, and the log names
+`TUNNEL_DRAIN` as the fix.
+
+### Retiring a tunnel
+
+1. Move the tunnel from `TUNNEL_MAP` (or `CF_TUNNEL_ID`) to `TUNNEL_DRAIN`. A route whose
+   hostname is still annotated is retargeted to the tunnel that now serves its domain. A route
+   whose annotation is gone is deleted, but only under `--policy=sync`.
+2. Watch `cfzt_provider_routes_by_tunnel{tunnel_id="<tunnel>"}`. It counts every live route this
+   instance manages on that tunnel, **including ones outside the domain filter**. This instance
+   never moves or deletes those, so remove them by hand.
+3. When it reads `0`, remove the tunnel from `TUNNEL_DRAIN`.
+
+Keep the API token able to read the draining tunnel until the gauge reaches `0`.
+
 ## Multiple instances
 
 Several instances can share one Cloudflare account, each on its own tunnel(s) and in its own
@@ -282,7 +322,7 @@ reconcile. It does **not** fail `ApplyChanges`, and it does not stop any other h
 |---|---|---|
 | `other` | Another external-dns owner holds it. | Nothing. It clears once that owner releases it. |
 | `untagged` | A route with no owner tag holds it (Terraform, by hand). | Set `ADOPT_UNTAGGED=true` to claim it in place, or remove that route. |
-| `self` | **This** owner already routes it, on a tunnel this instance does not list. Nothing will ever release it. | Add that tunnel to `TUNNEL_MAP`. |
+| `self` | **This** owner already routes it, on a tunnel this instance does not list. Nothing will ever release it. | Add that tunnel to `TUNNEL_DRAIN`. The route is then retargeted to the right tunnel. |
 | `unknown` | Refused, but no live holder was found: it may be mid-delete, or the token cannot see it. | Wait a few reconciles. |
 
 Alert on `cfzt_provider_routes_pending > 0` for longer than a few intervals, and on
@@ -311,14 +351,16 @@ Prometheus metrics are exposed on the health port at `/metrics` (the sample mani
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `cfzt_provider_api_requests_total` | counter | `operation` (`list`/`create`/`delete`/`patch`), `result` (`success`/`error`) | Cloudflare API calls |
+| `cfzt_provider_api_requests_total` | counter | `operation` (`list`/`create`/`delete`/`patch`/`retarget`), `result` (`success`/`error`) | Cloudflare API calls |
 | `cfzt_provider_routes_created_total` | counter | — | Hostname routes created |
 | `cfzt_provider_routes_deleted_total` | counter | — | Hostname routes deleted |
 | `cfzt_provider_routes_adopted_total` | counter | — | Pre-existing routes claimed in place (not counted as creates) |
+| `cfzt_provider_routes_retargeted_total` | counter | — | Routes moved to another tunnel in place (not counted as creates or deletes) |
+| `cfzt_provider_routes_by_tunnel` | gauge | `tunnel_id` | Live routes this instance manages on each tunnel it lists, including draining ones and zeros, regardless of the domain filter |
 | `cfzt_provider_apply_duration_seconds` | histogram | — | `ApplyChanges` reconcile duration |
 | `cfzt_provider_records_managed` | gauge | — | Managed routes seen on the last `Records()` |
 | `cfzt_provider_dry_run` | gauge | — | `1` while `DRY_RUN` suppresses all mutations, else `0` |
-| `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`/`patch`/`fragment`) | Mutations suppressed by dry run |
+| `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`/`patch`/`retarget`/`fragment`) | Mutations suppressed by dry run |
 | `cfzt_provider_coredns_writes_total` | counter | `result` | Applies of the managed CoreDNS fragment key |
 | `cfzt_provider_coredns_rewrites` | gauge | — | Rewrites in the managed key after the last write |
 | `cfzt_provider_routes_pending` | gauge | `reason` (`self`/`other`/`untagged`/`unknown`) | Hostnames whose create is refused as already routed and retried each reconcile (see [Multiple instances](#multiple-instances)) |

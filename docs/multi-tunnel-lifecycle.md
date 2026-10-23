@@ -3,8 +3,8 @@
 How several instances of this provider share one Cloudflare account: how a hostname moves between
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
-**Status.** Sections 1 to 4 and 9 describe behavior that exists today. Sections 5 and 6 describe
-work that is designed but not built, and say so. Section 7 (token isolation) and section 8 (live
+**Status.** Sections 1 to 5 and 9 describe behavior that exists today. Section 6 describes work
+that is designed but not built, and says so. Section 7 (token isolation) and section 8 (live
 measurements) are added by the changes that produce them.
 
 ## 1. Scope and operator invariants
@@ -58,7 +58,7 @@ ExternalDNS runs `Records`, then `AdjustEndpoints`, then plans, then `ApplyChang
 | Annotation added | Create route and rewrite. | Same. |
 | Annotation removed | Delete route and remove rewrite. | Nothing. ExternalDNS never plans a delete. |
 | Hostname renamed | Delete old and create new in one pass, deletes first. | Create new only. The old route stays. |
-| Domain moved to another tunnel in `TUNNEL_MAP` | **Not handled.** The plan emits an Update that `ApplyChanges` ignores. Planned in section 5. | Same. |
+| Domain moved to another tunnel in `TUNNEL_MAP` | The route is retargeted in place. The old tunnel must be in `TUNNEL_DRAIN`. See section 5. | Same: ExternalDNS lets Updates through `upsert-only`. |
 
 ### One batch, one failure
 
@@ -108,7 +108,7 @@ fails the batch.
 |---|---|---|---|
 | `other` | Another external-dns owner holds it. | Says it will be created once that owner releases it. The owner id is logged only at debug level. | The holder deletes it. |
 | `untagged` | A route with no owner tag holds it. | Names `ADOPT_UNTAGGED=true` when the route is on the wanted tunnel. | It is adopted, removed, or the holder moves it. |
-| `self` | **This** owner routes it on a tunnel this instance does not list. | Names `TUNNEL_MAP`. Nothing will release it, because `Records` cannot see it. | The tunnel is listed, or the route is removed. |
+| `self` | **This** owner routes it on a tunnel this instance does not list. | Names `TUNNEL_DRAIN`. Nothing will release it, because `Records` cannot see it. | The tunnel is added to `TUNNEL_DRAIN`, after which the route is retargeted, or the route is removed. |
 | `unknown` | Refused, but no live holder was found. | Says it may be mid-delete, or on a tunnel this token cannot see. | The create lands. |
 
 A pending host leaves the set on any of three pieces of evidence: its create succeeds, it appears
@@ -126,19 +126,41 @@ That is the price of keeping the handoff gap to one interval.
 host is in neither `Records` nor the desired set, so no delete is planned and nothing removes the
 staged rewrite. It stays in Y's fragment until an operator removes it.
 
-## 5. Draining a tunnel and retargeting a route (planned)
+## 5. Draining a tunnel and retargeting a route
 
-Not built. Two gaps remain in the current behavior:
+Two things used to go wrong when a tunnel changed, and both are handled now.
 
-- **A domain moved between tunnels in `TUNNEL_MAP` is ignored.** The plan emits an Update that
-  `ApplyChanges` drops, so the route stays on the old tunnel silently. Planned fix: retarget the
-  owned route in place with `PATCH {tunnel_id}`, which keeps the route id and opens no resolution
-  gap. This needs the old tunnel to stay listed.
-- **A tunnel removed from `TUNNEL_MAP` orphans its routes.** `Records` no longer lists it, the
-  plan re-creates each host on the new tunnel, and the create pends with `reason="self"` forever.
-  Planned fix: `TUNNEL_DRAIN=<tunnel-id>,...`, tunnels this instance lists and deletes from but
-  never creates on. Retire a tunnel by moving it to drain, waiting for its route count to reach
-  zero, then removing it.
+**A domain moved between tunnels in `TUNNEL_MAP`.** `Records` reports the route with its old
+tunnel's target, `AdjustEndpoints` canonicalizes the desired host to the new tunnel's target, and
+ExternalDNS plans an Update. That Update used to be dropped, so the route stayed on the old tunnel
+silently. Now `ApplyChanges` retargets the owned route in place with a `PATCH`. The route keeps
+its id, so there is no create/delete race and no gap in resolution. The CoreDNS rewrite does not
+change, because both tunnels terminate in the same cluster (section 1).
+
+- A route already on the wanted tunnel is left alone. That covers an Update planned for a TTL or
+  label difference.
+- A failed `PATCH` leaves the route on its old tunnel. `Records` still reports the old target, so
+  the next cycle plans the same Update, and the retry is idempotent.
+- One failing retarget does not stop the others.
+- Only routes this instance may manage are retargeted (section 1).
+- The request carries the documented full body: hostname, tunnel id and the existing comment.
+
+**A tunnel removed from `TUNNEL_MAP` without draining.** `Records` no longer lists it, so the plan
+creates each host again on the new tunnel and the create is refused as this owner's own route. It
+is reported as `pending` with `reason="self"` and nothing will ever release it. `TUNNEL_DRAIN`
+fixes this: tunnels this instance **lists and deletes from but never creates on**. `resolve` never
+returns one, and a tunnel may not be both configured and draining.
+
+Retire a tunnel by moving it to `TUNNEL_DRAIN`, watching
+`cfzt_provider_routes_by_tunnel{tunnel_id}` until it reads zero, then removing it. That gauge counts
+every live route this instance manages on the tunnel, including ones outside the domain filter,
+because counting only in-filter routes would read zero while routes were still stranded.
+
+**Not yet verified live.** That Cloudflare retargets on `PATCH`, keeps the route id, and accepts the
+body above has not been run against an account. `TestLiveRetargetPreservesRouteID` in
+`test/integration/` settles it, and also records whether a body with only `tunnel_id` is accepted.
+If the API turns out not to retarget on `PATCH`, the fallback is a delete followed by a create in
+the same pass, which opens a short gap.
 
 ## 6. Pruning (planned)
 
