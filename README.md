@@ -76,6 +76,7 @@ kubectl apply -f deploy/deployment.yaml
 | `COREDNS_CONFIGMAP` | no | — | `<namespace>/<name>` of the CoreDNS fragment ConfigMap. Setting it enables the CoreDNS leg (see [The CoreDNS leg](#the-coredns-leg)) |
 | `COREDNS_FRAGMENT_KEY` | no | `zz-external-dns.override` | ConfigMap key this instance owns |
 | `COREDNS_FIELD_MANAGER` | no | `external-dns` | Server-side-apply field manager; **must be unique to this writer** |
+| `COREDNS_PRUNE` | no | `true` | Remove CoreDNS rewrites that no route and no Service wants (see [Pruning stale rewrites](#pruning-stale-rewrites)). Set `false` to disable. Only matters when `COREDNS_CONFIGMAP` is set |
 | `CLUSTER_DOMAIN` | no | `cluster.local` | Cluster domain used to build `<svc>.<ns>.svc.<domain>` |
 | `DOMAIN_FILTER` | no | — | Comma-separated suffixes to manage (e.g. `private`) |
 | `WEBHOOK_LISTEN` | no | `127.0.0.1:8888` | Webhook API listen address (localhost-only by design) |
@@ -243,6 +244,30 @@ zero route diff. New routes and deletes still use the normal `ApplyChanges` path
 fragment-first ordering; the fragment's idempotence suppresses a write when the target already
 matches. `DRY_RUN=true` suppresses this reconciliation write too.
 
+### Pruning stale rewrites
+
+A rewrite can outlive the route it answered for: the route is deleted out of band, or a hostname is
+held by another instance, its rewrite is staged, and then its annotation is removed before the
+holder lets go. No delete is ever planned for such a host, so nothing else would remove the entry.
+
+With **`COREDNS_PRUNE=true` (the default)** each reconcile removes a rewrite only when **all** of
+these hold:
+
+- no live route this instance manages carries the hostname, on any tunnel it lists, including routes
+  outside the domain filter;
+- no Service currently wants it (this keeps the staged rewrite of a host that is waiting on another
+  instance);
+- it is inside `DOMAIN_FILTER`;
+- its domain still maps to a tunnel, so a domain that has left `TUNNEL_MAP` is left alone.
+
+It does nothing until a complete `Records` has run, so a freshly started instance cannot mistake an
+empty view for "nothing is owned". A failure to read or write the ConfigMap is logged and counted
+in `cfzt_provider_coredns_writes_total{result="error"}`; it never stops routes from being
+reconciled. `DRY_RUN=true` logs `would PRUNE stale CoreDNS rewrites` and removes nothing.
+
+The key has exactly one writer, which is why an entry nothing owns or wants is stale by
+construction. If you do hand-edit it against the warning in its header, prune will remove those lines.
+
 > **Interaction with IaC drift guards.** This key is written by a *runtime* writer, not by your IaC,
 > so a guard that diffs rendered IaC against the live ConfigMap will see it as drift. Allowlist it.
 
@@ -338,7 +363,7 @@ Alert on `cfzt_provider_routes_pending > 0` for longer than a few intervals, and
 The name is unresolvable from step 3 until Y's next reconcile, so lower `--interval` on Y while you
 migrate. Until the create lands, in-cluster clients in Y's cluster already resolve the name to Y's
 Service through the staged rewrite, while WARP clients still reach X. If you abandon the move
-before X releases the name, Y's staged rewrite stays in its CoreDNS fragment until you remove it.
+before X releases the name, CoreDNS prune removes Y's staged rewrite on the next reconcile.
 
 With `TUNNEL_MAP` and `COREDNS_CONFIGMAP` both set, every mapped tunnel must terminate in the
 cluster this instance writes CoreDNS for. The rewrite lives in one cluster and the route picks the
@@ -360,9 +385,12 @@ Prometheus metrics are exposed on the health port at `/metrics` (the sample mani
 | `cfzt_provider_apply_duration_seconds` | histogram | — | `ApplyChanges` reconcile duration |
 | `cfzt_provider_records_managed` | gauge | — | Managed routes seen on the last `Records()` |
 | `cfzt_provider_dry_run` | gauge | — | `1` while `DRY_RUN` suppresses all mutations, else `0` |
-| `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`/`patch`/`retarget`/`fragment`) | Mutations suppressed by dry run |
+| `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`/`patch`/`retarget`/`fragment`/`prune`) | Mutations suppressed by dry run |
 | `cfzt_provider_coredns_writes_total` | counter | `result` | Applies of the managed CoreDNS fragment key |
 | `cfzt_provider_coredns_rewrites` | gauge | — | Rewrites in the managed key after the last write |
+| `cfzt_provider_coredns_pruned_total` | counter | — | Stale rewrites removed because no route and no Service wanted them |
+| `cfzt_provider_routes_undesired` | gauge | — | Routes this instance owns on a listed tunnel that no Service desires. Near zero after each cycle under `--policy=sync`; under `upsert-only` it is the only place they are visible |
+| `cfzt_provider_routes_out_of_filter` | gauge | — | Routes this instance owns on a listed tunnel that fall outside `DOMAIN_FILTER`. It never retargets or deletes these |
 | `cfzt_provider_routes_pending` | gauge | `reason` (`self`/`other`/`untagged`/`unknown`) | Hostnames whose create is refused as already routed and retried each reconcile (see [Multiple instances](#multiple-instances)) |
 | `cfzt_provider_list_errors_total` | counter | `tunnel_id` (`account` for an account-wide list) | Failed attempts to list hostname routes |
 
