@@ -63,6 +63,9 @@ func main() {
 	dryRun := envBool("DRY_RUN", false)
 	adoptUntagged := envBool("ADOPT_UNTAGGED", false)
 	tunnelDrain := splitCSV(os.Getenv("TUNNEL_DRAIN"))
+	// Pruning stale CoreDNS rewrites is on by default; it only takes effect when COREDNS_CONFIGMAP
+	// enables the CoreDNS leg at all.
+	corednsPrune := envBool("COREDNS_PRUNE", true)
 	domainFilter := splitCSV(os.Getenv("DOMAIN_FILTER"))
 	webhookListen := envOr("WEBHOOK_LISTEN", "127.0.0.1:8888")
 	healthListen := envOr("HEALTH_LISTEN", "0.0.0.0:8080")
@@ -91,6 +94,7 @@ func main() {
 		AdoptUntagged:   adoptUntagged,
 		DomainFilter:    domainFilter,
 		CoreDNS:         fragment,
+		CoreDNSPrune:    corednsPrune,
 		Metrics:         m,
 		Logger:          log,
 	})
@@ -106,7 +110,7 @@ func main() {
 		"tunnel_id", tunnelID, "tunnel_map", tunnelMap, "tunnel_drain", tunnelDrain, "account_id", accountID,
 		"owner_id", ownerID, "ownership_strict", ownershipStrict, "dry_run", dryRun,
 		"adopt_untagged", adoptUntagged, "domain_filter", domainFilter,
-		"coredns_configmap", envOr("COREDNS_CONFIGMAP", ""))
+		"coredns_configmap", envOr("COREDNS_CONFIGMAP", ""), "coredns_prune", corednsPrune)
 
 	if dryRun {
 		log.Warn("DRY_RUN=true: NO Cloudflare route will be created or deleted; " +
