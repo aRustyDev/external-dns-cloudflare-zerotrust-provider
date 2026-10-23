@@ -68,7 +68,7 @@ kubectl apply -f deploy/deployment.yaml
 | `CF_ACCOUNT_ID` | yes | — | Cloudflare account ID |
 | `CF_TUNNEL_ID` | conditional | — | Single-tunnel mode: tunnel the hostname routes bind to. Required unless `TUNNEL_MAP` is set |
 | `TUNNEL_MAP` | conditional | — | Multi-tunnel mode: `domain=tunnelID,...` (most-specific domain wins). Supersedes `CF_TUNNEL_ID` |
-| `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`) |
+| `OWNER_ID` | no | `default` | Tags created routes' `comment` (`managed-by=external-dns/<id>`). **Must be unique per instance** in an account; the provider warns while it is still `default` (see [Multiple instances](#multiple-instances)) |
 | `OWNERSHIP_STRICT` | no | `true` | Only read back / delete routes carrying this `OWNER_ID` (see [Ownership](#ownership)) |
 | `DRY_RUN` | no | `false` | Log intended route creates/deletes and make **no** mutating Cloudflare call (see [Dry run](#dry-run)) |
 | `ADOPT_UNTAGGED` | no | `false` | Claim a pre-existing route for a managed hostname instead of failing (see [Adopting existing routes](#adopting-existing-routes)) |
@@ -123,7 +123,9 @@ With **`OWNERSHIP_STRICT=true` (the default)** the provider only ever *sees* (in
 *deletes* routes carrying its own `OWNER_ID`. Routes created by Terraform, by hand, or by a
 different owner are invisible to it and can never be deleted by it — important where an external
 system is the declared sole owner of some routes. Set `OWNERSHIP_STRICT=false` only to
-deliberately adopt/manage pre-existing routes regardless of their comment.
+deliberately manage pre-existing routes that carry **no** tag. In **either** mode a route tagged by
+a *different* external-dns owner is never read back, deleted or retargeted, so one instance cannot
+delete another's routes.
 
 > Strict mode + `--policy=sync` is the safe production combination: deletes are enabled but
 > confined to this instance's own routes.
@@ -159,7 +161,8 @@ re-`PATCH` on every reconcile. `DRY_RUN=true` suppresses the `PATCH` as well.
 
 Cloudflare's `1108` message reads `Hostname Route already routed to another tunnel` **even when
 the existing route is on the same tunnel** — so read the code, not the message. When adoption is
-off, the provider surfaces that error with a pointer to this flag.
+off, the host is held *pending* rather than failed (see [Multiple instances](#multiple-instances)),
+and the log points at this flag.
 
 ## The CoreDNS leg
 
@@ -250,6 +253,53 @@ Each hostname is bound to the tunnel of its **longest matching domain suffix**, 
 `svc.apps.private` → `tunnel-a` and `other.private` → `tunnel-b`. A hostname matching no configured
 domain is skipped.
 
+## Multiple instances
+
+Several instances can share one Cloudflare account, each on its own tunnel(s) and in its own
+cluster. Two rules keep that safe, and the provider cannot check either from inside one instance:
+
+1. **Every instance needs a unique `OWNER_ID`.** Instances sharing one treat each other's routes
+   as their own and delete them under `--policy=sync`. The provider warns at startup when
+   `OWNER_ID` is still `default`.
+2. **A non-strict instance must be the only writer of untagged routes on its tunnels.**
+
+Whatever the settings, a route tagged by a *different* owner is never read back, deleted or
+retargeted. Give each owner disjoint domain suffixes where you can, since Cloudflare allows only
+one route per hostname in the whole account.
+
+### A hostname that is already routed is *pending*, not an error
+
+Cloudflare refuses a second route for a hostname with `HTTP 409` / error `1108`, whichever tunnel
+holds it. That refusal is the mutex between instances, so the provider treats it as a state to wait
+out. The host is logged, counted in `cfzt_provider_routes_pending{reason}`, and retried on every
+reconcile. It does **not** fail `ApplyChanges`, and it does not stop any other host in the batch.
+
+| `reason` | Meaning | What to do |
+|---|---|---|
+| `other` | Another external-dns owner holds it. | Nothing. It clears once that owner releases it. |
+| `untagged` | A route with no owner tag holds it (Terraform, by hand). | Set `ADOPT_UNTAGGED=true` to claim it in place, or remove that route. |
+| `self` | **This** owner already routes it, on a tunnel this instance does not list. Nothing will ever release it. | Add that tunnel to `TUNNEL_MAP`. |
+| `unknown` | Refused, but no live holder was found: it may be mid-delete, or the token cannot see it. | Wait a few reconciles. |
+
+Alert on `cfzt_provider_routes_pending > 0` for longer than a few intervals, and on
+`reason="self"` at all. The owner of another instance's route is logged only at debug level.
+
+### Moving a hostname from instance X to instance Y
+
+1. Annotate the Service in Y's cluster. Y stages its CoreDNS rewrite and holds the host `pending`.
+2. Remove the annotation in X's cluster. X must run `--policy=sync`; under `upsert-only` X never
+   deletes, so the handoff never completes.
+3. X deletes its route and rewrite. On Y's next reconcile the create succeeds.
+
+The name is unresolvable from step 3 until Y's next reconcile, so lower `--interval` on Y while you
+migrate. Until the create lands, in-cluster clients in Y's cluster already resolve the name to Y's
+Service through the staged rewrite, while WARP clients still reach X. If you abandon the move
+before X releases the name, Y's staged rewrite stays in its CoreDNS fragment until you remove it.
+
+With `TUNNEL_MAP` and `COREDNS_CONFIGMAP` both set, every mapped tunnel must terminate in the
+cluster this instance writes CoreDNS for. The rewrite lives in one cluster and the route picks the
+tunnel, so a route on a tunnel in another cluster resolves nowhere.
+
 ## Metrics
 
 Prometheus metrics are exposed on the health port at `/metrics` (the sample manifest sets the
@@ -267,6 +317,8 @@ Prometheus metrics are exposed on the health port at `/metrics` (the sample mani
 | `cfzt_provider_dry_run_skipped_total` | counter | `operation` (`create`/`delete`/`patch`/`fragment`) | Mutations suppressed by dry run |
 | `cfzt_provider_coredns_writes_total` | counter | `result` | Applies of the managed CoreDNS fragment key |
 | `cfzt_provider_coredns_rewrites` | gauge | — | Rewrites in the managed key after the last write |
+| `cfzt_provider_routes_pending` | gauge | `reason` (`self`/`other`/`untagged`/`unknown`) | Hostnames whose create is refused as already routed and retried each reconcile (see [Multiple instances](#multiple-instances)) |
+| `cfzt_provider_list_errors_total` | counter | `tunnel_id` (`account` for an account-wide list) | Failed attempts to list hostname routes |
 
 ## Development
 

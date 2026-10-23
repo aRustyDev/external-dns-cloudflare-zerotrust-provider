@@ -42,7 +42,7 @@ const OpFragment = "fragment"
 // already routed" (Cloudflare error 1108) and is being retried on every reconcile.
 const (
 	// PendingSelf: the hostname is routed by THIS owner on a tunnel this instance does not list.
-	// Nothing will ever release it; the fix is a TUNNEL_DRAIN or TUNNEL_MAP entry.
+	// Nothing will ever release it; the fix is to list that tunnel (TUNNEL_MAP).
 	PendingSelf = "self"
 	// PendingOther: another external-dns owner holds it. It clears when that owner releases it.
 	PendingOther = "other"

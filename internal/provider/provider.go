@@ -537,8 +537,8 @@ func (p *Provider) classifyConflict(host, wantTunnel string, r cloudflare.Hostna
 		return metrics.PendingSelf
 	case p.owns(r):
 		p.log.Info("hostname route not created: THIS owner already routes it on a tunnel this "+
-			"instance does not list, and nothing will release it; add that tunnel to TUNNEL_DRAIN "+
-			"(or TUNNEL_MAP)", "hostname", host, "wanted_tunnel_id", wantTunnel,
+			"instance does not list, and nothing will release it; add that tunnel to TUNNEL_MAP "+
+			"so it is listed, or remove the route", "hostname", host, "wanted_tunnel_id", wantTunnel,
 			"held_on_tunnel_id", r.TunnelID, "route_id", r.ID)
 		return metrics.PendingSelf
 	case managed:

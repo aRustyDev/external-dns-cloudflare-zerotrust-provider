@@ -1403,8 +1403,8 @@ func TestApplyChanges_409BySelfOnUnlistedTunnel(t *testing.T) {
 	if got := pendingValue(t, reg, metrics.PendingSelf); got != 1 {
 		t.Errorf("routes_pending{self} = %v, want 1", got)
 	}
-	if !strings.Contains(logs.String(), "TUNNEL_DRAIN") {
-		t.Errorf("log should name TUNNEL_DRAIN as the fix; got:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "TUNNEL_MAP") {
+		t.Errorf("log should name listing the tunnel as the fix; got:\n%s", logs.String())
 	}
 }
 
