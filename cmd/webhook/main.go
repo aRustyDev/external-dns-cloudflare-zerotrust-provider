@@ -60,7 +60,6 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 	accountID := mustEnv(log, "CF_ACCOUNT_ID")
-	apiToken := mustEnv(log, "CF_API_TOKEN")
 	tunnelID := os.Getenv("CF_TUNNEL_ID")
 	tunnelMap, err := parseTunnelMap(os.Getenv("TUNNEL_MAP"))
 	if err != nil {
@@ -96,7 +95,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := cloudflare.New(accountID, apiToken)
+	// Where hostname-route calls go: Cloudflare directly with an account token (the default), or the
+	// route broker, in which case this instance holds no account token at all.
+	client, routeBackend, err := newRouteClient(os.Getenv)
+	if err != nil {
+		log.Error("route backend configuration error", "err", err)
+		os.Exit(1)
+	}
 	p, err := cfprovider.New(cfprovider.Config{
 		Client:          client,
 		TunnelID:        tunnelID,
@@ -121,7 +126,8 @@ func main() {
 
 	log.Info("starting webhook provider",
 		"webhook", webhookListen, "health", healthListen,
-		"tunnel_id", tunnelID, "tunnel_map", tunnelMap, "tunnel_drain", tunnelDrain, "account_id", accountID,
+		"route_backend", routeBackend, "tunnel_id", tunnelID, "tunnel_map", tunnelMap,
+		"tunnel_drain", tunnelDrain, "account_id", accountID,
 		"owner_id", ownerID, "ownership_strict", ownershipStrict, "dry_run", dryRun,
 		"adopt_untagged", adoptUntagged, "domain_filter", domainFilter,
 		"coredns_configmap", envOr("COREDNS_CONFIGMAP", ""), "coredns_prune", corednsPrune)
