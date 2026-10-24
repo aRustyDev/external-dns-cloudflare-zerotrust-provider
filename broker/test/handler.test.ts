@@ -203,6 +203,27 @@ describe("list", () => {
     });
     assert.equal((await odd(new Request(`https://broker.test${routes}`))).status, 502);
   });
+
+  // MEASURED in workerd (wrangler dev) on 2026-10-24: `{ fetch }.fetch(url)` throws "Illegal
+  // invocation: function called with incorrect `this` reference", while `const f = fetch; f(url)`
+  // works. Node accepts both, so the first deployed broker answered every request with error 1101.
+  it("calls fetch detached, because the Workers runtime refuses it as a method of another object", async () => {
+    const runtimeFetch = function (this: unknown): Promise<Response> {
+      if (this !== undefined && this !== globalThis) throw new TypeError("Illegal invocation");
+      const page = { page: 1, per_page: 100, count: 0, total_count: 0 };
+      return Promise.resolve(new Response(JSON.stringify({ success: true, result: [], result_info: page })));
+    };
+    const handle = createHandler({
+      policy: POLICY,
+      accountId: ACCOUNT,
+      upstreamBase: "https://upstream.test/client/v4",
+      upstreamToken: SECRET,
+      authenticate: async () => ({ clientId: "x" }),
+      fetch: runtimeFetch as unknown as typeof fetch,
+      log: () => {},
+    });
+    assert.equal((await handle(new Request(`https://broker.test${routes}`))).status, 200);
+  });
 });
 
 describe("create", () => {

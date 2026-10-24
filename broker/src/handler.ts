@@ -113,8 +113,13 @@ export function createHandler(deps: Deps): (request: Request) => Promise<Respons
     "content-type": "application/json",
   };
 
+  // Called detached on purpose: the Workers runtime throws "Illegal invocation" when fetch is called
+  // as a method of another object (deps.fetch(...)), which Node does not, so only a test that mimics
+  // the runtime's check can notice.
+  const send = deps.fetch;
+
   async function upstream(method: string, url: string, body?: unknown): Promise<Response> {
-    return deps.fetch(url, {
+    return send(url, {
       method,
       headers: upstreamHeaders,
       body: body === undefined ? undefined : JSON.stringify(body),
