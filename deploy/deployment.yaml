@@ -196,6 +196,11 @@ spec:
             # drop CF_TUNNEL_ID and set TUNNEL_MAP instead (most-specific domain wins):
             #   - name: TUNNEL_MAP
             #     value: "apps.private=<tunnel-a>,private=<tunnel-b>"
+            # TUNNEL_DRAIN lists tunnels this instance still LISTS and deletes from but never creates
+            # on. When you move a domain to another tunnel in TUNNEL_MAP, or retire a tunnel, keep
+            # the old one here until cfzt_provider_routes_by_tunnel for it reads 0.
+            #   - name: TUNNEL_DRAIN
+            #     value: "<old-tunnel-id>"
             - name: WEBHOOK_LISTEN
               value: "127.0.0.1:8888"
             - name: HEALTH_LISTEN

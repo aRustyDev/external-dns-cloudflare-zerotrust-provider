@@ -88,6 +88,7 @@ type routeAPI interface {
 	ListHostnameRoutes(ctx context.Context, tunnelID string) ([]cloudflare.HostnameRoute, error)
 	CreateHostnameRoute(ctx context.Context, hostname, tunnelID, comment string) (*cloudflare.HostnameRoute, error)
 	PatchHostnameRouteComment(ctx context.Context, id, comment string) (*cloudflare.HostnameRoute, error)
+	PatchHostnameRoute(ctx context.Context, id string, patch cloudflare.RoutePatch) (*cloudflare.HostnameRoute, error)
 	DeleteHostnameRoute(ctx context.Context, id string) error
 }
 
@@ -129,6 +130,11 @@ type Config struct {
 	// precedence over TunnelID and a hostname is bound to the tunnel of its longest matching
 	// domain suffix.
 	TunnelMap map[string]string
+	// TunnelDrain lists tunnels this instance still LISTS and deletes from but never creates on.
+	// Move a tunnel here, instead of dropping it from the configuration, to retire it: its routes
+	// stay visible, so a hostname moved to another tunnel is retargeted and a removed one deleted,
+	// rather than the routes being orphaned. A tunnel may not also be configured.
+	TunnelDrain []string
 	// OwnerID tags managed routes and, in strict mode, scopes which routes are managed.
 	OwnerID string
 	// OwnershipStrict, when true, restricts Records()/deletes to routes this owner created.
@@ -172,6 +178,9 @@ func New(cfg Config) (*Provider, error) {
 		resolver = newSingleTunnelResolver(cfg.TunnelID)
 	default:
 		return nil, fmt.Errorf("a tunnel id or a non-empty tunnel map is required")
+	}
+	if err := resolver.setDrain(cfg.TunnelDrain); err != nil {
+		return nil, err
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -243,7 +252,12 @@ func (p *Provider) manageable(r cloudflare.HostnameRoute) bool {
 // It filters by domain filter and by ownership (see manageable).
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	var out []*endpoint.Endpoint
+	// Routes this instance manages on each listed tunnel, counted BEFORE the domain filter and
+	// including zeros. A draining tunnel reading 0 means it can be retired; counting only
+	// in-filter routes would read 0 while out-of-filter routes were still stranded on it.
+	perTunnel := map[string]int{}
 	for _, tid := range p.resolver.tunnels() {
+		perTunnel[tid] = 0
 		routes, err := p.client.ListHostnameRoutes(ctx, tid)
 		p.metrics.APIRequest(metrics.OpList, err)
 		if err != nil {
@@ -255,15 +269,17 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 			if r.DeletedAt != nil {
 				continue
 			}
-			if !p.domainFilter.Match(r.Hostname) {
+			if !p.manageable(r) {
 				continue
 			}
-			if !p.manageable(r) {
+			perTunnel[tid]++
+			if !p.domainFilter.Match(r.Hostname) {
 				continue
 			}
 			out = append(out, endpoint.NewEndpoint(r.Hostname, recordType, target))
 		}
 	}
+	p.metrics.SetRoutesByTunnel(perTunnel)
 	p.metrics.SetRecordsManaged(len(out))
 	p.rememberRecordHosts(out)
 	// A host that now appears here exists and is ours, so it is no longer waiting on anyone.
@@ -356,8 +372,10 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 	return p.domainFilter
 }
 
-// ApplyChanges deletes and creates hostname routes to satisfy the plan. Updates are no-ops: a
-// route is just a hostname->tunnel binding with no mutable attributes this provider manages.
+// ApplyChanges deletes, retargets and creates hostname routes to satisfy the plan. An Update is a
+// retarget: ExternalDNS plans one when a hostname's tunnel target changed, which is what happens
+// when TUNNEL_MAP moves its domain to another tunnel. The route is moved in place (see
+// applyUpdates), keeping its id, so there is no create/delete race and no gap in resolution.
 //
 // Failures are PER HOST. A hostname that cannot be applied (no resource label, no tunnel for its
 // domain, a refused adoption, an API error) is reported and skipped, and every other change in
@@ -386,17 +404,17 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 // and misconfiguration (e.g. a hostname with no configured tunnel) still fails loudly. A create
 // is never attempted in dry-run, so no conflict is observed and nothing is marked pending.
 func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
-	if changes == nil || (len(changes.Create) == 0 && len(changes.Delete) == 0) {
+	if changes == nil || (len(changes.Create) == 0 && len(changes.Delete) == 0 && len(changes.UpdateNew) == 0) {
 		return nil
 	}
 	start := time.Now()
 	defer func() { p.metrics.ObserveApply(time.Since(start).Seconds()) }()
 
-	// Build hostname -> route from the live set once, for deletes. Only routes this instance may
-	// manage are eligible (see manageable), so we never delete Terraform-owned, hand-created or
-	// sibling-owned ones.
+	// Build hostname -> route from the live set once, for deletes and retargets. Only routes this
+	// instance may manage are eligible (see manageable), so we never touch Terraform-owned,
+	// hand-created or sibling-owned ones.
 	var index map[string]cloudflare.HostnameRoute
-	if len(changes.Delete) > 0 {
+	if len(changes.Delete) > 0 || len(changes.UpdateNew) > 0 {
 		idx, err := p.ownedRouteIndex(ctx)
 		if err != nil {
 			return err
@@ -424,6 +442,7 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 
 	errs := skippedErrors(skipped)
 	errs = append(errs, p.applyDeletes(ctx, changes.Delete, index)...)
+	errs = append(errs, p.applyUpdates(ctx, changes.UpdateNew, index)...)
 	errs = append(errs, p.applyCreates(ctx, changes.Create, existing, skipped)...)
 	return errors.Join(errs...)
 }
@@ -451,6 +470,56 @@ func (p *Provider) applyDeletes(ctx context.Context, deletes []*endpoint.Endpoin
 			continue
 		}
 		p.metrics.RouteDeleted()
+	}
+	return errs
+}
+
+// applyUpdates retargets the routes the plan moves to another tunnel, returning one error per host
+// that failed. The route is PATCHed in place, so it keeps its id and the hostname never stops
+// being routed. The old tunnel must still be listed (it is, while it drains), or Records would not
+// have reported the route and no Update would have been planned.
+//
+// A PATCH that fails leaves the route on its old tunnel, so Records still reports the old target,
+// the plan plans the same Update next cycle, and the retry is idempotent. An Update whose route is
+// already on the wanted tunnel is a no-op, which covers a TTL- or label-only update.
+//
+// The full body (hostname, tunnel_id and comment) is sent, because that is the documented form;
+// see cloudflare.PatchHostnameRoute for what has not yet been verified live.
+func (p *Provider) applyUpdates(ctx context.Context, updates []*endpoint.Endpoint, index map[string]cloudflare.HostnameRoute) []error {
+	var errs []error
+	for _, ep := range updates {
+		if !p.domainFilter.Match(ep.DNSName) {
+			continue
+		}
+		want, ok := p.resolver.resolve(ep.DNSName)
+		if !ok {
+			errs = append(errs, fmt.Errorf("no tunnel configured for hostname %q", ep.DNSName))
+			continue
+		}
+		r, ok := index[strings.ToLower(ep.DNSName)]
+		if !ok {
+			continue // not manageable by this instance, or already gone
+		}
+		if r.TunnelID == want {
+			continue
+		}
+		if p.dryRun {
+			p.log.Info("dry run: would RETARGET hostname route", "hostname", ep.DNSName,
+				"route_id", r.ID, "from_tunnel_id", r.TunnelID, "to_tunnel_id", want)
+			p.metrics.DryRunSkipped(metrics.OpRetarget)
+			continue
+		}
+		_, err := p.client.PatchHostnameRoute(ctx, r.ID, cloudflare.RoutePatch{
+			Hostname: r.Hostname, TunnelID: want, Comment: r.Comment,
+		})
+		p.metrics.APIRequest(metrics.OpRetarget, err)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("retarget route %q to tunnel %s: %w", ep.DNSName, want, err))
+			continue
+		}
+		p.metrics.RouteRetargeted()
+		p.log.Info("retargeted hostname route", "hostname", ep.DNSName, "route_id", r.ID,
+			"from_tunnel_id", r.TunnelID, "to_tunnel_id", want)
 	}
 	return errs
 }
@@ -537,8 +606,8 @@ func (p *Provider) classifyConflict(host, wantTunnel string, r cloudflare.Hostna
 		return metrics.PendingSelf
 	case p.owns(r):
 		p.log.Info("hostname route not created: THIS owner already routes it on a tunnel this "+
-			"instance does not list, and nothing will release it; add that tunnel to TUNNEL_MAP "+
-			"so it is listed, or remove the route", "hostname", host, "wanted_tunnel_id", wantTunnel,
+			"instance does not list, and nothing will release it; add that tunnel to TUNNEL_DRAIN "+
+			"so it is listed and retargeted, or remove the route", "hostname", host, "wanted_tunnel_id", wantTunnel,
 			"held_on_tunnel_id", r.TunnelID, "route_id", r.ID)
 		return metrics.PendingSelf
 	case managed:

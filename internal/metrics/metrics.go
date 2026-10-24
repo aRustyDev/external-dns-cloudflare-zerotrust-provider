@@ -32,6 +32,9 @@ const (
 	OpCreate = "create"
 	OpDelete = "delete"
 	OpPatch  = "patch"
+	// OpRetarget is a PATCH that moves a route to another tunnel, kept apart from OpPatch (which is
+	// adoption's comment rewrite) so the two can be told apart on a dashboard.
+	OpRetarget = "retarget"
 )
 
 // OpFragment labels dry-run suppression of a CoreDNS fragment write. It is deliberately NOT a
@@ -70,6 +73,8 @@ type Metrics struct {
 	corednsRewrite prometheus.Gauge
 	routesPending  *prometheus.GaugeVec
 	listErrors     *prometheus.CounterVec
+	routesRetarget prometheus.Counter
+	routesByTunnel *prometheus.GaugeVec
 }
 
 // New builds the collectors (unregistered). Call MustRegister to attach them to a registry.
@@ -124,6 +129,14 @@ func New() *Metrics {
 			Namespace: namespace, Subsystem: subsystem, Name: "list_errors_total",
 			Help: "Failed attempts to list hostname routes, by tunnel id (\"account\" for an account-wide list).",
 		}, []string{"tunnel_id"}),
+		routesRetarget: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "routes_retargeted_total",
+			Help: "Hostname routes moved to another tunnel in place by PATCH (no delete/recreate).",
+		}),
+		routesByTunnel: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "routes_by_tunnel",
+			Help: "Live routes this instance manages on each tunnel it lists, regardless of the domain filter.",
+		}, []string{"tunnel_id"}),
 	}
 }
 
@@ -142,6 +155,8 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.corednsRewrite,
 		m.routesPending,
 		m.listErrors,
+		m.routesRetarget,
+		m.routesByTunnel,
 	)
 }
 
@@ -262,4 +277,25 @@ func (m *Metrics) ListError(tunnelID string) {
 		return
 	}
 	m.listErrors.WithLabelValues(tunnelID).Inc()
+}
+
+// RouteRetargeted increments the retargeted-routes counter. A retarget moves a route to another
+// tunnel in place, so it is deliberately NOT counted as a create or a delete.
+func (m *Metrics) RouteRetargeted() {
+	if m == nil {
+		return
+	}
+	m.routesRetarget.Inc()
+}
+
+// SetRoutesByTunnel publishes how many live routes this instance manages on each tunnel it lists.
+// Every listed tunnel must be present, zeros included: a draining tunnel reading 0 is the signal
+// that it can be removed from the configuration, and a missing series would read as "unknown".
+func (m *Metrics) SetRoutesByTunnel(counts map[string]int) {
+	if m == nil {
+		return
+	}
+	for tunnelID, n := range counts {
+		m.routesByTunnel.WithLabelValues(tunnelID).Set(float64(n))
+	}
 }

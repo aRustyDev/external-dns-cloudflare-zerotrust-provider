@@ -184,3 +184,46 @@ func TestAPIError(t *testing.T) {
 		t.Fatalf("want auth error surfaced, got %v", err)
 	}
 }
+
+// PatchHostnameRoute is the retarget primitive. It sends exactly the fields that are set, so a
+// caller can send the documented full body or a single field, and the route it gets back carries
+// the new tunnel under the SAME id.
+func TestPatchHostnameRoute_SendsOnlySetFields(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotBody = nil
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		_, _ = w.Write([]byte(`{"success":true,"result":{"id":"route-1","hostname":"foo.private","tunnel_id":"tun-2","comment":"managed-by=external-dns/x"}}`))
+	}))
+	defer srv.Close()
+	c := New(acct, "tok", WithBaseURL(srv.URL))
+
+	route, err := c.PatchHostnameRoute(context.Background(), "route-1", RoutePatch{
+		Hostname: "foo.private", TunnelID: "tun-2", Comment: "managed-by=external-dns/x",
+	})
+	if err != nil {
+		t.Fatalf("PatchHostnameRoute: %v", err)
+	}
+	if gotMethod != http.MethodPatch || !strings.HasSuffix(gotPath, "/zerotrust/routes/hostname/route-1") {
+		t.Errorf("request = %s %s, want PATCH .../zerotrust/routes/hostname/route-1", gotMethod, gotPath)
+	}
+	if len(gotBody) != 3 || gotBody["hostname"] != "foo.private" || gotBody["tunnel_id"] != "tun-2" ||
+		gotBody["comment"] != "managed-by=external-dns/x" {
+		t.Errorf("full body = %v, want {hostname, tunnel_id, comment}", gotBody)
+	}
+	if route.ID != "route-1" || route.TunnelID != "tun-2" {
+		t.Errorf("route = %+v, want the same id on the new tunnel", route)
+	}
+
+	// A zero field is omitted rather than sent as an empty string, which could blank the field.
+	if _, err := c.PatchHostnameRoute(context.Background(), "route-1", RoutePatch{TunnelID: "tun-2"}); err != nil {
+		t.Fatalf("PatchHostnameRoute: %v", err)
+	}
+	if len(gotBody) != 1 || gotBody["tunnel_id"] != "tun-2" {
+		t.Errorf("single-field body = %v, want exactly {tunnel_id}", gotBody)
+	}
+}

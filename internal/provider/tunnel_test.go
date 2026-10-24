@@ -91,3 +91,66 @@ func TestResolver_MapValidation(t *testing.T) {
 		t.Error("empty domain key should error")
 	}
 }
+
+// A draining tunnel is listed (so its routes stay visible and can be retargeted or deleted) but is
+// never a create target, whatever hostname is asked for.
+func TestResolver_DrainListedNeverResolved(t *testing.T) {
+	r, err := newMapTunnelResolver(map[string]string{"apps.private": "t-apps", "private": "t-root"})
+	if err != nil {
+		t.Fatalf("newMapTunnelResolver: %v", err)
+	}
+	if err := r.setDrain([]string{"t-old"}); err != nil {
+		t.Fatalf("setDrain: %v", err)
+	}
+
+	got := r.tunnels()
+	sort.Strings(got)
+	if want := []string{"t-apps", "t-old", "t-root"}; len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("tunnels() = %v, want %v (configured plus draining)", got, want)
+	}
+	for _, host := range []string{"a.apps.private", "b.private", "c.other.private", "private"} {
+		if tid, ok := r.resolve(host); ok && tid == "t-old" {
+			t.Errorf("resolve(%q) returned the draining tunnel", host)
+		}
+	}
+}
+
+func TestResolver_DrainWorksWithASingleTunnel(t *testing.T) {
+	r := newSingleTunnelResolver("tun-1")
+	if err := r.setDrain([]string{"tun-old"}); err != nil {
+		t.Fatalf("setDrain: %v", err)
+	}
+	if got := r.tunnels(); len(got) != 2 || got[0] != "tun-1" || got[1] != "tun-old" {
+		t.Fatalf("tunnels() = %v, want [tun-1 tun-old]", got)
+	}
+	if tid, _ := r.resolve("anything.private"); tid != "tun-1" {
+		t.Errorf("resolve = %q, want the configured tunnel, never the draining one", tid)
+	}
+}
+
+// A tunnel that is both configured and draining would be a create target and a retirement
+// candidate at once. That is a configuration mistake, so it is refused rather than guessed at.
+func TestResolver_DrainOverlapRefused(t *testing.T) {
+	single := newSingleTunnelResolver("tun-1")
+	if err := single.setDrain([]string{"tun-1"}); err == nil {
+		t.Error("single-tunnel mode: want an error when the drain tunnel is the configured one")
+	}
+
+	mapped, err := newMapTunnelResolver(map[string]string{"apps.private": "t-apps"})
+	if err != nil {
+		t.Fatalf("newMapTunnelResolver: %v", err)
+	}
+	if err := mapped.setDrain([]string{"t-other", "t-apps"}); err == nil {
+		t.Error("map mode: want an error when a drain tunnel is also a mapped tunnel")
+	}
+}
+
+func TestResolver_DrainIgnoresBlanksAndRepeats(t *testing.T) {
+	r := newSingleTunnelResolver("tun-1")
+	if err := r.setDrain([]string{" ", "tun-old", "", "tun-old", " tun-old "}); err != nil {
+		t.Fatalf("setDrain: %v", err)
+	}
+	if got := r.tunnels(); len(got) != 2 || got[1] != "tun-old" {
+		t.Fatalf("tunnels() = %v, want [tun-1 tun-old] with no duplicates", got)
+	}
+}
