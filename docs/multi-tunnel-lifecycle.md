@@ -5,8 +5,8 @@ them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
 **Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 8 records what a live
 run on 2026-10-23 measured: five of the six questions about Cloudflare's behavior are answered. The
-sixth, whether a token bound to one tunnel is enforced on hostname routes, is not, so section 7
-(token isolation) is not written yet.
+sixth, whether a token bound to one tunnel is enforced on hostname routes, could not be tested
+because no such token can be created, so section 7 designs a broker instead.
 
 ## 1. Scope and operator invariants
 
@@ -257,6 +257,10 @@ WARP Read and Write, and Connector: cloudflared Read and Write.
 **Run 2, the same token with Cloudflare One Networks Read and Write added.** Route creation worked
 and every test that could run passed. The results are in the table.
 
+**Also measured, read-only:** a hostname route can be fetched by id (`GET .../routes/hostname/{id}`
+returns `200` with `id`, `hostname`, `tunnel_id` and `comment`), and an unknown id returns `404` with
+error `1107`, "Hostname Route not found". The broker relies on both.
+
 A data point for row 2, not its answer: a token holding cloudflared Write was refused hostname-route
 creation, and creation worked only after an account-level Networks permission was added. That
 suggests hostname-route writes are governed by the Networks permission rather than by tunnel
@@ -276,7 +280,7 @@ go test -tags=integration -v -count=1 \
 | # | Question | Test | What the docs say | Result |
 |---|---|---|---|---|
 | 1 | Does `PATCH` with `tunnel_id` retarget a route and keep its id? Is a body with only `tunnel_id` accepted? | `TestLiveRetargetPreservesRouteID`, `TestLiveProviderRetargetsFromADrainingTunnel` | The teamnet routes API documents `tunnel_id` on update. Nothing found for hostname routes. | **MEASURED 2026-10-23.** A `PATCH` with the full body `{hostname, tunnel_id, comment}` moved a route from tunnel A to tunnel B: same route id, listed on B and no longer on A. A `PATCH` with only `{tunnel_id}` was also accepted and moved it back, same id. The whole provider path (`Records`, `AdjustEndpoints`, ExternalDNS's planner, `ApplyChanges`) retargeted a route off a draining tunnel in one reconcile, same id. |
-| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | **UNVERIFIED:** there is no tunnel-scoped token to test with. See the data point above. |
+| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | **UNVERIFIED by test, resolved by availability.** The test needs an API token bound to one tunnel, and none can be made. The account owner reported on 2026-10-23 that the dashboard offers no way to scope a token to specific tunnels. The spike token, which had Networks write, connector and Connectivity Directory permissions, got `403` (error `9109`) on both the list-tokens and list-permission-groups endpoints, so a token cannot be minted through the API with it either. Cloudflare's documentation offers tunnel scoping for member and permission policies, and lists only Access objects for resource-scoped API tokens. See the data point above. |
 | 3 | After a route is deleted, how long does its hostname stay refused with `1108`? | `TestLiveSoftDeleteWindow` | Not documented. The API soft-deletes (`deleted_at`). | **MEASURED 2026-10-23.** No window. Re-creating a hostname straight after deleting its route succeeded on the first attempt, 704 ms after the delete returned, as a new route id. `1108` was never returned. A soft-deleted route does not hold the name. |
 | 4 | How is a wildcard stored, and is an exact create under it on another tunnel refused? Which wins when a client resolves the name? | `TestLiveWildcardVsExact` | One leading wildcard label is allowed and stored without the `*`. Precedence against an exact route is undocumented. | **MEASURED 2026-10-23, API half.** A create for `*.<name>` succeeded and was stored as `<name>`, with the leading `*.` stripped. An exact create for `a.<name>` on a different tunnel then succeeded too, so a wildcard and an exact route can coexist and `1108` does not arbitrate between them. **UNVERIFIED:** which one wins when a client resolves the name, which needs a WARP client. |
 | 5 | What happens to a tunnel's hostname routes when the tunnel is deleted? | `TestLiveTunnelDeleteCascade` | Not documented. | **MEASURED 2026-10-23.** No cascade. Deleting a tunnel that has a hostname route was refused: `400`, error `1023`, "This tunnel has private network routes. Please remove all routes before deleting the tunnel." The route stayed. A tunnel with no routes deleted normally. |
@@ -286,11 +290,11 @@ go test -tags=integration -v -count=1 \
 
 - **Row 1:** retargeting is the in-place `PATCH` that exists today. The delete-then-create fallback
   was not needed and was not built.
-- **Row 2 (open):** decides section 7. If a token bound to one tunnel lists only its own routes, gets
-  `409` for a hostname held elsewhere, and is refused (`403` or `404`) when it patches or deletes a
-  foreign route, Cloudflare isolates tunnels natively and the work is a token recipe plus tests. If
-  it can see or touch routes on tunnels it does not cover, isolation needs a stateless broker in
-  front of the account token. Section 7 is not written until this row is answered.
+- **Row 2:** decided section 7 by availability rather than by the test. Native isolation would have
+  needed a token bound to one tunnel, and that cannot be created, so isolation comes from a
+  stateless broker in front of the account token (section 7). If Cloudflare later offers
+  tunnel-scoped tokens, `TestLiveScopedTokenHostnameRoutes` answers whether they cover hostname
+  routes, and the broker could be retired.
 - **Row 3:** a handoff's gap is one reconcile interval and nothing more.
 - **Row 4:** wildcards and exact routes can coexist across tunnels, so a wildcard can be taken by
   one instance without refusing another's exact route. See the known limitation in section 9 for
