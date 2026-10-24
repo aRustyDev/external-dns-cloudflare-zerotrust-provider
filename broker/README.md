@@ -77,6 +77,9 @@ You need a Cloudflare account with Zero Trust (for Access) and permission to dep
 4. **Put an Access application in front of it.** For a `workers.dev` address, enable Cloudflare
    Access from the Worker's Domains and Routes settings. Give the application a **Service Auth**
    policy that includes the service tokens from step 1, and copy the application's audience tag.
+   Created through the API, that is a `self_hosted` application whose `domain` is the Worker's
+   `<name>.<subdomain>.workers.dev` hostname and whose one policy has `decision: "non_identity"` and
+   an `include` of each `service_token`. The audience tag is the application's `aud`.
 5. **Set the variables** in `wrangler.jsonc` and deploy again: `ACCESS_TEAM_DOMAIN`
    (`<team>.cloudflareaccess.com`), `ACCESS_AUD` (the audience tag) and `POLICY`.
 6. **Point each instance at it.** See "Using it" below.
@@ -86,7 +89,8 @@ You need a Cloudflare account with Zero Trust (for Access) and permission to dep
 The Worker's `CF_API_TOKEN` needs only **Cloudflare One Networks Read and Write**, because it only
 calls the hostname-routes endpoints. It does not need tunnel, connector or token permissions. It
 cannot be narrower than the whole account, because Cloudflare offers nothing narrower, which is the
-reason the broker exists.
+reason the broker exists. A token holding exactly those two permission groups on the account was
+enough to list, create and delete routes through a live deployment.
 
 ## Using it
 
@@ -118,6 +122,10 @@ had been removed.
 - **Logs:** one line per decision with the client id, operation, status, hostname and tunnel. A
   `denied` event with `unauthenticated` means a request reached the Worker without a valid Access
   JWT, which should not happen when Access is in front of it.
+- **Cloudflare error `1010` from a client** is the Browser Integrity Check refusing its
+  `User-Agent`, before Access or the Worker see the request. The provider names itself; a script
+  calling the broker needs to send a `User-Agent` that is not its HTTP library's default.
+- **Cloudflare error `1101`** is the Worker throwing. Look at its logs (`wrangler tail`).
 
 ## Tests
 
@@ -132,6 +140,10 @@ go test ./test/broker/                     # from the repo root: the real Go cli
 The Go end-to-end test runs the real handler behind a small local server, with only Cloudflare faked.
 It is `e2e/serve.ts`, which **trusts a client-id header as identity and must never be deployed**.
 
+`test/integration/broker_live_test.go` (build tag `integration`) is the same contract against a real
+deployment: the Worker, a real Access application and the real Cloudflare API. Its header lists the
+environment it needs. It never reads `CF_API_TOKEN`, so nothing it does holds the account token.
+
 ## What is and is not verified
 
 - **Verified by tests:** every policy rule, every refusal and redaction, the pass-through of
@@ -139,12 +151,28 @@ It is `e2e/serve.ts`, which **trusts a client-id header as identity and must nev
   forwarded, JWT signature, issuer, audience, expiry and algorithm checks (with real RSA keys), and
   the contract with the Go client and provider, including the provider's owner tag against the
   policy.
-- **Verified against Cloudflare's documentation, not a live token:** that a service token's JWT
-  carries the client id as `common_name`, an empty `sub`, an `iss` of `https://<team>.cloudflareaccess.com`
-  and the application's tag in `aud`.
-- **Not verified:** the Worker has **not been deployed or run in the Workers runtime**, and no
-  request has gone through a real Access application. Do that in a test account first. The bundle
-  builds (`wrangler deploy --dry-run`), but that is not the same thing.
+- **Verified live on 2026-10-23**, on a throwaway deployment in a real account that was torn down
+  afterwards (`TestLiveBrokerThroughAccess`, seven subtests, all passing). The Worker ran in the
+  Workers runtime, and a real Access application accepted a service token and passed the Worker a
+  JWT it accepted: the signature against the team's real keys, the issuer, the audience, and a
+  `common_name` equal to the service token's client id, which is the policy key. Through it, a
+  client listed only its own routes, the provider created a route, a second client could neither see
+  nor delete it (`404` / `1107`), naming another client's tunnel was refused (`403`), and a hostname
+  another client held came back as Cloudflare's own `409` / `1108`, which the provider treated as
+  pending without the holder appearing in its log. A request with no service token was answered
+  `403` by Access and never reached the Worker.
+- **Found only by that run, and fixed.** The first deployment answered every request with
+  Cloudflare error `1101`: the handler called `deps.fetch(...)`, and the Workers runtime throws
+  `Illegal invocation` for a `fetch` called as a method of another object, which Node does not, so no
+  unit test could see it. The handler now calls it detached, and a test mimics the runtime's check
+  (a mutation that restores the method call fails it). The run also showed Cloudflare's Browser
+  Integrity Check refusing a Python client's default `User-Agent` with error `1010`; the provider's
+  client now sends a named one. Whether Go's default `User-Agent` would have been refused as well
+  was not tested.
+- **Still not verified:** a successful `PATCH` (retarget) through the broker, since the live run only
+  exercised refused ones; a key rotation on Access's side picked up by the Worker; a list of hundreds
+  of routes (paging was only run against the fake); load; and a deployment that outlives a
+  three-hour run, including rotating its secrets.
 - **Not covered:** a compromised Worker or its secrets, an administrator of the Cloudflare account,
   and an instance abusing the access its own policy grants. There is no rate limiting. The broker
   is a single point of failure for changes.

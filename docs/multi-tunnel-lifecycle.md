@@ -3,9 +3,10 @@
 How several instances of this provider share one Cloudflare account: how a hostname moves between
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
-**Status.** Sections 1 to 7 and 9 describe behavior that exists today, except that the broker in
-section 7 has been tested but not deployed to a Workers runtime. Section 8 records what a live run
-on 2026-10-23 measured: all six questions about Cloudflare's behavior are answered. The
+**Status.** Sections 1 to 7 and 9 describe behavior that exists today, and the broker in section 7
+has been deployed and exercised once, on a throwaway deployment (section 8, "The broker, live").
+Section 8 records what live runs on 2026-10-23 measured: all six questions about Cloudflare's
+behavior are answered. The
 sixth, whether a token bound to one tunnel is enforced on hostname routes, was answered by
 Cloudflare's own permission catalog instead of the scoped-token test: no permission can be bound to
 one tunnel, so that test cannot be run. Section 7 describes the broker that provides isolation
@@ -324,12 +325,15 @@ is why the broker exists, but it is held by one Worker instead of by every clust
   keys, and the contract between the real Go client and provider and the real broker code, including
   that the provider's owner tag satisfies the broker's policy. Mutating each protection makes a test
   fail.
-- **Verified against Cloudflare's documentation, not a live token:** the shape of a service token's JWT.
-  `common_name` is the service token's client id, `sub` is empty, `iss` is
-  `https://<team>.cloudflareaccess.com` and `aud` carries the application's tag.
-- **Not verified:** the Worker has **not been deployed or run in the Workers runtime**, and no request
-  has passed through a real Access application. It bundles (`wrangler deploy --dry-run`), but deploy it
-  to a test account and run the provider against it before relying on it.
+- **Verified live, on a throwaway deployment:** the Worker in the Workers runtime, a real Access
+  application, and the real Cloudflare API, driven by the real Go client and provider. The JWT Access
+  issues carries the service token's client id as `common_name`, the team's issuer and the
+  application's audience, and the Worker accepts it. See "The broker, live" in section 8, including
+  two defects that only that run could find.
+- **Not verified:** a successful `PATCH` (retarget) through the broker, since the live run only
+  exercised refused ones; a key rotation on Access's side picked up by the Worker; a list of hundreds
+  of routes, which only the fake has paged; load; and a deployment that lives longer than the
+  three-hour run, including rotating its secrets.
 
 ## 8. Live measurements (spike)
 
@@ -410,6 +414,48 @@ go test -tags=integration -v -count=1 \
 - **Row 6:** the owner tag must fit in 256 characters. Its prefix `managed-by=external-dns/` is 24, so
   an `OWNER_ID` can be at most 232 characters. A single-hostname lookup is also possible, which the
   409 classifier could use instead of listing the account.
+
+### The broker, live
+
+**MEASURED 2026-10-23**, on a deployment made for the purpose and torn down afterwards: two tunnels,
+two Access service tokens, one Access application, the Worker on `workers.dev`, and an upstream
+token that held only Cloudflare One Networks Read and Write and expired after three hours.
+`TestLiveBrokerThroughAccess` (`test/integration/broker_live_test.go`) drove it with the real Go
+client and provider and never held the account token. All seven subtests passed on the fourth run:
+
+| What was asked | What was observed |
+|---|---|
+| An authenticated list | `200` and no routes, on a fresh tunnel. The Worker verified the JWT Access issued, against the team's real keys, and found the client in its policy by `common_name`. |
+| A request with no service token | `403` from Access. It never reached the Worker. |
+| The provider creates a route | The route exists on the client's tunnel with the client's owner tag. |
+| A second client lists, then deletes the first's route | It does not see it. The delete is `404`, error `1107`, the same as for an unknown id. The route survives. |
+| A client names another client's tunnel, or retargets onto it | Both refused, `403`. |
+| Two clients want one hostname | Cloudflare's own `409`, error `1108`, passed through. The provider reports it pending and neither the holder's tunnel nor its owner id appears in the provider's log. |
+| Each client deletes its own routes | Succeeded. |
+
+Four runs were needed, and the first three failed for reasons no earlier test could have found:
+
+1. **Access answers a service-auth-only application with `403`, not a redirect to a login page.** A
+   probe that waited for a redirect to learn the team domain could never succeed. The team domain is
+   public and is in the domain of the organization's other Access applications.
+2. **Cloudflare error `1010`.** The Browser Integrity Check refused a Python client's default
+   `User-Agent` before Access or the Worker saw the request. A request with a named `User-Agent`
+   went through. The provider's client now sends one (`cloudflare.UserAgent`, replaceable with
+   `WithHeader`). Whether Go's default `Go-http-client` would have been refused as well was not
+   tested.
+3. **Cloudflare error `1101`: the Worker threw on every request.** The handler called
+   `deps.fetch(...)`, and the Workers runtime throws "Illegal invocation: function called with
+   incorrect this reference" for a `fetch` that is called as a method of another object. This was
+   reproduced in `wrangler dev`: `{ fetch }.fetch(url)` throws, while `const f = fetch; f(url)` and
+   `(i, n) => fetch(i, n)` both work. Node accepts all three, so 90 passing unit tests and the Go
+   end-to-end test could not see it. The handler now calls it detached, and a unit test mimics the
+   runtime's check; restoring the method call fails that test.
+
+A live account also moved while this ran: other external-dns instances on other tunnels created
+routes during the day. A route count taken before and after the runs is therefore not evidence about
+the runs. What was checked instead is that no resource named for the spike remained, by name rather
+than by the orchestrator's own record of ids: no tunnel, hostname route, Access application, service
+token, Worker script or account API token.
 
 ## 9. Not built, and why
 
