@@ -227,3 +227,60 @@ func TestPatchHostnameRoute_SendsOnlySetFields(t *testing.T) {
 		t.Errorf("single-field body = %v, want exactly {tunnel_id}", gotBody)
 	}
 }
+
+// A client given no token must send no Authorization header, and WithHeader must reach every
+// request. Together they let the client authenticate to a broker with Access service-token headers.
+func TestClient_NoTokenSendsNoAuthorizationAndWithHeaderIsSent(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_, _ = w.Write([]byte(`{"success":true,"result":[],"result_info":{"page":1,"per_page":100,"count":0,"total_count":0}}`))
+	}))
+	defer srv.Close()
+
+	c := New(acct, "", WithBaseURL(srv.URL), WithHeader("X-One", "1"), WithHeader("X-Two", "2"), WithHeader("X-One", "last"))
+	if _, err := c.ListHostnameRoutes(context.Background(), ""); err != nil {
+		t.Fatalf("ListHostnameRoutes: %v", err)
+	}
+	if v := got.Get("Authorization"); v != "" {
+		t.Errorf("Authorization = %q, want none for an empty token", v)
+	}
+	if got.Get("X-One") != "last" || got.Get("X-Two") != "2" {
+		t.Errorf("headers = %v, want X-One=last (the last value wins) and X-Two=2", got)
+	}
+
+	// With a token it still sends the bearer header, as before.
+	withToken := New(acct, "tok", WithBaseURL(srv.URL))
+	if _, err := withToken.ListHostnameRoutes(context.Background(), ""); err != nil {
+		t.Fatalf("ListHostnameRoutes: %v", err)
+	}
+	if v := got.Get("Authorization"); v != "Bearer tok" {
+		t.Errorf("Authorization = %q, want the bearer token", v)
+	}
+}
+
+// Go's default User-Agent is one Cloudflare's Browser Integrity Check can refuse (error 1010) once
+// a request crosses an Access-protected hostname, so the client always names itself, and a caller
+// can still replace the name.
+func TestClient_SendsANamedUserAgentThatWithHeaderCanReplace(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte(`{"success":true,"result":[],"result_info":{"page":1,"per_page":100,"count":0,"total_count":0}}`))
+	}))
+	defer srv.Close()
+
+	if _, err := New(acct, "tok", WithBaseURL(srv.URL)).ListHostnameRoutes(context.Background(), ""); err != nil {
+		t.Fatalf("ListHostnameRoutes: %v", err)
+	}
+	if got != UserAgent || strings.HasPrefix(got, "Go-http-client") {
+		t.Errorf("User-Agent = %q, want %q", got, UserAgent)
+	}
+
+	if _, err := New(acct, "tok", WithBaseURL(srv.URL), WithHeader("User-Agent", "custom/1")).ListHostnameRoutes(context.Background(), ""); err != nil {
+		t.Fatalf("ListHostnameRoutes: %v", err)
+	}
+	if got != "custom/1" {
+		t.Errorf("User-Agent = %q, want the WithHeader override", got)
+	}
+}

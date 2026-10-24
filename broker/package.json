@@ -1,0 +1,15 @@
+{
+  "name": "edns-cfzt-route-broker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Per-client policy broker in front of Cloudflare's hostname-routes API",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "check": "npx --yes -p typescript@5.9.3 tsc -p .",
+    "deploy": "npx wrangler deploy"
+  },
+  "engines": {
+    "node": ">=23.6"
+  }
+}

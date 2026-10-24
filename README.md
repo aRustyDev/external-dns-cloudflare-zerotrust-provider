@@ -64,8 +64,12 @@ kubectl apply -f deploy/deployment.yaml
 
 | Env | Required | Default | Description |
 |---|---|---|---|
-| `CF_API_TOKEN` | yes | — | Scoped Cloudflare API token (preferred over a global key) |
+| `CF_API_TOKEN` | conditional | — | Cloudflare API token with Cloudflare One Networks write. Required unless `ROUTE_BACKEND=broker`, and **refused** alongside it. It is account-wide whatever you do; see [Token isolation](#token-isolation) |
 | `CF_ACCOUNT_ID` | yes | — | Cloudflare account ID |
+| `ROUTE_BACKEND` | no | `cloudflare` | `cloudflare` talks to Cloudflare with `CF_API_TOKEN`. `broker` talks to the [route broker](broker/README.md) and holds no account token |
+| `BROKER_URL` | with `broker` | — | The broker's address. Must be `https`, or `http` for localhost only |
+| `BROKER_CLIENT_ID` | with `broker` | — | This instance's Cloudflare Access service-token client id |
+| `BROKER_CLIENT_SECRET` | with `broker` | — | This instance's Access service-token secret |
 | `CF_TUNNEL_ID` | conditional | — | Single-tunnel mode: tunnel the hostname routes bind to. Required unless `TUNNEL_MAP` is set |
 | `TUNNEL_MAP` | conditional | — | Multi-tunnel mode: `domain=tunnelID,...` (most-specific domain wins). Supersedes `CF_TUNNEL_ID` |
 | `TUNNEL_DRAIN` | no | — | Comma-separated tunnel IDs this instance still **lists and deletes from** but never creates on. Retire a tunnel by moving it here (see [Retiring a tunnel](#retiring-a-tunnel)). A tunnel may not also be configured |
@@ -401,6 +405,41 @@ ConfigMap, so remove that key there if the cluster is still running.
 With `TUNNEL_MAP` and `COREDNS_CONFIGMAP` both set, every mapped tunnel must terminate in the
 cluster this instance writes CoreDNS for. The rewrite lives in one cluster and the route picks the
 tunnel, so a route on a tunnel in another cluster resolves nowhere.
+
+## Token isolation
+
+The token this provider needs, Cloudflare One Networks write, is **account-wide**. Cloudflare offers
+no narrower scope: every tunnel, connector and Networks permission group accepts only the whole
+account, so a token cannot be limited to one tunnel or to one tunnel's routes. Any instance that holds
+it can read, change and delete every hostname route in the account. Ownership tags keep a well-behaved
+instance out of other owners' routes, but a compromised cluster is not bound by them.
+
+If instances belong to different owners or run in clusters you do not trust equally, put them behind
+the **route broker** in [`broker/`](broker/README.md). It is a Cloudflare Worker that holds the account
+token. Each instance holds only a Cloudflare Access service token, and the broker lets it see and change
+only its own tunnels and hostnames:
+
+- An instance lists only its own routes. A route that is not its own gets the same answer as a route
+  that does not exist.
+- When a hostname is already taken, Cloudflare's `409` / `1108` passes through untouched. The instance
+  learns that the name is taken and nothing about who holds it, and treats it as
+  [pending](#a-hostname-that-is-already-routed-is-pending-not-an-error).
+- The instance never holds an account token. It refuses to start with `ROUTE_BACKEND=broker` while
+  `CF_API_TOKEN` is also set.
+
+```
+ROUTE_BACKEND=broker
+BROKER_URL=https://<your-broker-address>
+BROKER_CLIENT_ID=<service token client id>
+BROKER_CLIENT_SECRET=<service token secret>
+```
+
+The broker narrows who can reach the account token; it does not remove the token, and it adds one
+component that must be available for changes to apply. If the broker is down, `Records` fails and
+ExternalDNS aborts that reconcile cycle, though existing routes keep serving. **It has been tested but
+not yet deployed to a Workers runtime**, so try it in a test account first. What is and is not verified
+is listed in [`broker/README.md`](broker/README.md#what-is-and-is-not-verified) and in
+[`docs/multi-tunnel-lifecycle.md`](docs/multi-tunnel-lifecycle.md) section 7.
 
 ## Metrics
 

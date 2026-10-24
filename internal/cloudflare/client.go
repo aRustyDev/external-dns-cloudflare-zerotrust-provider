@@ -69,6 +69,7 @@ type Client struct {
 	AccountID  string
 	BaseURL    string
 	token      string
+	headers    [][2]string
 	httpClient *http.Client
 }
 
@@ -78,11 +79,22 @@ type Option func(*Client)
 // WithBaseURL overrides the API root (used in tests).
 func WithBaseURL(u string) Option { return func(c *Client) { c.BaseURL = u } }
 
+// UserAgent is sent on every request unless WithHeader replaces it.
+const UserAgent = "external-dns-cloudflare-zerotrust-provider"
+
+// WithHeader adds a header to every request. A repeated name is sent once, with the last value. It
+// exists so the client can speak to a broker that authenticates with Cloudflare Access service-token
+// headers instead of a bearer token.
+func WithHeader(name, value string) Option {
+	return func(c *Client) { c.headers = append(c.headers, [2]string{name, value}) }
+}
+
 // WithHTTPClient overrides the underlying *http.Client.
 func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.httpClient = h } }
 
 // New returns a Client authenticated with a scoped API token (recommended over a
-// global API key: it can be limited to Account > Cloudflare Tunnel / Zero Trust edit).
+// global API key: it can be limited to Account > Cloudflare Tunnel / Zero Trust edit). An empty
+// token sends no Authorization header at all, which is what a client talking to a broker wants.
 func New(accountID, apiToken string, opts ...Option) *Client {
 	c := &Client{
 		AccountID:  accountID,
@@ -134,7 +146,15 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	// A named User-Agent, because Go's default is one Cloudflare's Browser Integrity Check can refuse
+	// (error 1010) once a request crosses an Access-protected hostname. WithHeader can override it.
+	req.Header.Set("User-Agent", UserAgent)
+	for _, h := range c.headers {
+		req.Header.Set(h[0], h[1])
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)

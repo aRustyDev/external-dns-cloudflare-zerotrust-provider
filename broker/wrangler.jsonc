@@ -1,0 +1,20 @@
+// Deploy with `npx wrangler deploy` from this directory. Set the two secrets first:
+//
+//   npx wrangler secret put CF_API_TOKEN     # account token with Cloudflare One Networks write
+//   npx wrangler secret put CF_ACCOUNT_ID
+//
+// Then put an Access application in front of the Worker (see README.md), and set the three vars
+// below. Nothing in this file is secret: the policy names tunnels and suffixes, not credentials.
+{
+  "name": "edns-cfzt-route-broker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "<your-team>.cloudflareaccess.com",
+    "ACCESS_AUD": "<the Access application's audience tag>",
+    // Keyed by the Access service token's client id, which is the JWT common_name.
+    "POLICY": "{\"<client-id>.access\": {\"owner\": \"cluster-a\", \"tunnels\": [\"<tunnel-id>\"], \"suffixes\": [\"apps.example.private\"]}}"
+  }
+}

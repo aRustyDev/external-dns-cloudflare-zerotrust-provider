@@ -196,6 +196,15 @@ spec:
             # wants (default true). Set "false" to keep stale entries until you remove them.
             # - name: COREDNS_PRUNE
             #   value: "true"
+            # --- Token isolation (optional) ---
+            # By default this instance holds CF_API_TOKEN, an ACCOUNT-WIDE token. To keep that token
+            # out of the cluster, run the route broker (broker/README.md) and use it instead. Remove
+            # CF_API_TOKEN from the secret below: the instance refuses to start with both set.
+            # - name: ROUTE_BACKEND
+            #   value: "broker"
+            # - name: BROKER_URL
+            #   value: "https://<your-broker-address>"
+            # BROKER_CLIENT_ID and BROKER_CLIENT_SECRET (the Access service token) belong in the secret.
             # Single tunnel via CF_TUNNEL_ID (from the secret below). For multiple tunnels,
             # drop CF_TUNNEL_ID and set TUNNEL_MAP instead (most-specific domain wins):
             #   - name: TUNNEL_MAP

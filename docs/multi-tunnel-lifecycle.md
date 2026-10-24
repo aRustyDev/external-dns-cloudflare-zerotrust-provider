@@ -3,10 +3,14 @@
 How several instances of this provider share one Cloudflare account: how a hostname moves between
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
-**Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 8 records what a live
-run on 2026-10-23 measured: five of the six questions about Cloudflare's behavior are answered. The
-sixth, whether a token bound to one tunnel is enforced on hostname routes, could not be tested
-because no such token can be created, so section 7 designs a broker instead.
+**Status.** Sections 1 to 7 and 9 describe behavior that exists today, and the broker in section 7
+has been deployed and exercised once, on a throwaway deployment (section 8, "The broker, live").
+Section 8 records what live runs on 2026-10-23 measured: all six questions about Cloudflare's
+behavior are answered. The
+sixth, whether a token bound to one tunnel is enforced on hostname routes, was answered by
+Cloudflare's own permission catalog instead of the scoped-token test: no permission can be bound to
+one tunnel, so that test cannot be run. Section 7 describes the broker that provides isolation
+instead.
 
 ## 1. Scope and operator invariants
 
@@ -228,6 +232,109 @@ Running it against a live instance's owner id is an outage window for every rout
 because that instance recreates whatever it still desires on its next reconcile. The usage text and
 the README both say so.
 
+## 7. Token isolation: the route broker
+
+### The problem
+
+The provider's token needs Cloudflare One Networks write, which is an account-wide permission. Any
+instance that holds it can read, change and delete **every** hostname route in the account, whatever
+tunnel or owner it belongs to. Ownership tags keep a well-behaved instance out of other owners'
+routes, but they are a convention the instance itself enforces. A compromised cluster is not bound
+by it.
+
+Section 8, row 2 shows Cloudflare gives no way around this. Every tunnel, connector and Networks
+permission group accepts only the whole account as its scope, so no API token can be limited to one
+tunnel or to one tunnel's routes.
+
+### The design
+
+A Cloudflare Worker holds the account token. Each instance holds only an Access service token, and
+calls the Worker instead of Cloudflare.
+
+```
+instance X ──(Access service token)──▶ ┌────────────┐ ──(account token)──▶ Cloudflare
+instance Y ──(Access service token)──▶ │   broker   │                      hostname-routes API
+                                        └────────────┘
+                                         policy: client → tunnels, suffixes, owner
+```
+
+- **Same API.** The broker serves Cloudflare's own paths and response envelope, so the provider's
+  existing client works against it with a different base URL and different headers. Cloudflare's
+  error codes and the decoding that relies on them, such as `1108` for a taken hostname, work
+  unchanged.
+- **Identity** is a verified Cloudflare Access JWT. Access checks the service token. The Worker then
+  verifies the JWT itself (RS256 signature against the team's keys, issuer, audience, expiry) so a
+  request that reached the Worker some other way is refused. Only a service token's identity, its
+  `common_name` claim, is accepted.
+- **Policy** maps each client to its tunnels, its hostname suffixes, and optionally its owner. It is
+  validated at startup and anything ambiguous makes the Worker refuse everything.
+
+### What the broker enforces
+
+| Request | Rule |
+|---|---|
+| List | Only the client's own tunnels. Naming another tunnel is `403`. With none named, it lists the client's tunnels and nothing else, so an account-wide list through the broker is the client's own routes. |
+| Create | The tunnel must be the client's, the hostname must be under one of its suffixes, and the comment must be exactly its owner tag when it has one. Only the three known fields reach Cloudflare. |
+| Patch | The route must be the client's. It may move only onto another of the client's tunnels, and rename only within its suffixes. |
+| Delete | The route must be the client's. |
+| Anything else | Refused. |
+
+**Redaction.** A route that is not the client's gets exactly the response a route that does not exist
+gets, `404` with error `1107`, so route ids cannot be probed. A list never contains another client's
+route.
+
+**The conflict signal survives, and leaks nothing.** Cloudflare returns `409` with error `1108` when a
+hostname is already routed, whichever tunnel holds it, and that response names no holder. The broker
+passes it through untouched. The provider treats it as pending (section 4), and because its
+account-wide lookup through the broker returns only its own routes, the reason is `unknown`. An
+instance learns that a name is taken and nothing about who has it, which is the requirement.
+
+### Using it
+
+On the instance: `ROUTE_BACKEND=broker`, `BROKER_URL`, `BROKER_CLIENT_ID` and `BROKER_CLIENT_SECRET`
+instead of `CF_API_TOKEN`. The instance refuses to start if `CF_API_TOKEN` is also set, because the
+point is that no account-wide token reaches the cluster. Deployment and operation are in
+[`broker/README.md`](../broker/README.md).
+
+The Worker's own token needs only Cloudflare One Networks Read and Write. It cannot be narrower, which
+is why the broker exists, but it is held by one Worker instead of by every cluster.
+
+### Failure modes
+
+| What fails | What happens |
+|---|---|
+| The broker is down | `Records` fails, so ExternalDNS aborts that whole reconcile cycle. Existing routes keep serving; only changes stall. |
+| The policy disagrees with an instance's configuration | The broker answers `403`. The provider reports the host as a failed create, or fails the batch for a list, so it is loud. |
+| The policy cannot be parsed | The Worker answers `500` to everything. It fails closed. |
+| Access is misconfigured or bypassed | Requests without a valid JWT get `401`. |
+| A key rotation at Access | An unknown key id triggers one refetch of the team's keys, at most once a minute. |
+
+### What this does not protect against
+
+- **A compromise of the Worker, its secrets, or an administrator of the Cloudflare account.** The
+  account token still exists, in one place. The broker narrows who can reach it; it does not remove it.
+- **An instance abusing the access its own policy grants.** It can still change its own routes.
+- **Availability.** There is no rate limiting, and the broker is a single point of failure for changes.
+- **A wrong policy.** The policy and each instance's `TUNNEL_MAP` are two sources of truth. A mismatch is
+  loud, but nothing checks them against each other.
+
+### What is verified, and what is not
+
+- **Verified by tests:** every policy rule, every refusal and redaction, the pass-through of `409` /
+  `1108`, that no secret is logged and no caller credential is forwarded, the JWT checks with real RSA
+  keys, and the contract between the real Go client and provider and the real broker code, including
+  that the provider's owner tag satisfies the broker's policy. Mutating each protection makes a test
+  fail.
+- **Verified live, on a throwaway deployment:** the Worker in the Workers runtime, a real Access
+  application, and the real Cloudflare API, driven by the real Go client and provider. The JWT Access
+  issues carries the service token's client id as `common_name`, the team's issuer and the
+  application's audience, and the Worker accepts it. See "The broker, live" in section 8, including
+  two defects that only that run could find.
+- **Not verified:** a successful `PATCH` (retarget) through the broker, since the live run only
+  exercised refused ones; a key rotation on Access's side picked up by the Worker; a list of hundreds
+  of routes, which only the fake has paged; load; and a deployment that lives longer than the
+  three-hour run, including rotating its secrets.
+
 ## 8. Live measurements (spike)
 
 Six questions about Cloudflare's behavior shape this design. Each row below is either
@@ -257,6 +364,9 @@ WARP Read and Write, and Connector: cloudflared Read and Write.
 **Run 2, the same token with Cloudflare One Networks Read and Write added.** Route creation worked
 and every test that could run passed. The results are in the table.
 
+**Operational note:** a permission added to the spike token took about 150 seconds to take effect.
+The token endpoints returned `403` (error `9109`) for ten polls at 15-second intervals, then `200`.
+
 **Also measured, read-only:** a hostname route can be fetched by id (`GET .../routes/hostname/{id}`
 returns `200` with `id`, `hostname`, `tunnel_id` and `comment`), and an unknown id returns `404` with
 error `1107`, "Hostname Route not found". The broker relies on both.
@@ -280,7 +390,7 @@ go test -tags=integration -v -count=1 \
 | # | Question | Test | What the docs say | Result |
 |---|---|---|---|---|
 | 1 | Does `PATCH` with `tunnel_id` retarget a route and keep its id? Is a body with only `tunnel_id` accepted? | `TestLiveRetargetPreservesRouteID`, `TestLiveProviderRetargetsFromADrainingTunnel` | The teamnet routes API documents `tunnel_id` on update. Nothing found for hostname routes. | **MEASURED 2026-10-23.** A `PATCH` with the full body `{hostname, tunnel_id, comment}` moved a route from tunnel A to tunnel B: same route id, listed on B and no longer on A. A `PATCH` with only `{tunnel_id}` was also accepted and moved it back, same id. The whole provider path (`Records`, `AdjustEndpoints`, ExternalDNS's planner, `ApplyChanges`) retargeted a route off a draining tunnel in one reconcile, same id. |
-| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | **UNVERIFIED by test, resolved by availability.** The test needs an API token bound to one tunnel, and none can be made. The account owner reported on 2026-10-23 that the dashboard offers no way to scope a token to specific tunnels. The spike token, which had Networks write, connector and Connectivity Directory permissions, got `403` (error `9109`) on both the list-tokens and list-permission-groups endpoints, so a token cannot be minted through the API with it either. Cloudflare's documentation offers tunnel scoping for member and permission policies, and lists only Access objects for resource-scoped API tokens. See the data point above. |
+| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | **MEASURED 2026-10-23, from the API.** No API token can be bound to one tunnel, so the test cannot be run. With Account API Tokens Read on the spike token, `GET /accounts/{id}/tokens/permission_groups` listed 413 permission groups. Every tunnel-related group (Cloudflare Tunnel, cloudflared, Connectors, WARP, Networks) has the single scope `com.cloudflare.api.account`, the whole account. The only narrower scopes in the catalog are zones, Flagship apps, Worker scripts and R2 buckets. The account owner saw the same in the dashboard, which offers no way to scope a token to specific tunnels. Cloudflare documents tunnel scoping only for member and permission policies. |
 | 3 | After a route is deleted, how long does its hostname stay refused with `1108`? | `TestLiveSoftDeleteWindow` | Not documented. The API soft-deletes (`deleted_at`). | **MEASURED 2026-10-23.** No window. Re-creating a hostname straight after deleting its route succeeded on the first attempt, 704 ms after the delete returned, as a new route id. `1108` was never returned. A soft-deleted route does not hold the name. |
 | 4 | How is a wildcard stored, and is an exact create under it on another tunnel refused? Which wins when a client resolves the name? | `TestLiveWildcardVsExact` | One leading wildcard label is allowed and stored without the `*`. Precedence against an exact route is undocumented. | **MEASURED 2026-10-23, API half.** A create for `*.<name>` succeeded and was stored as `<name>`, with the leading `*.` stripped. An exact create for `a.<name>` on a different tunnel then succeeded too, so a wildcard and an exact route can coexist and `1108` does not arbitrate between them. **UNVERIFIED:** which one wins when a client resolves the name, which needs a WARP client. |
 | 5 | What happens to a tunnel's hostname routes when the tunnel is deleted? | `TestLiveTunnelDeleteCascade` | Not documented. | **MEASURED 2026-10-23.** No cascade. Deleting a tunnel that has a hostname route was refused: `400`, error `1023`, "This tunnel has private network routes. Please remove all routes before deleting the tunnel." The route stayed. A tunnel with no routes deleted normally. |
@@ -290,11 +400,11 @@ go test -tags=integration -v -count=1 \
 
 - **Row 1:** retargeting is the in-place `PATCH` that exists today. The delete-then-create fallback
   was not needed and was not built.
-- **Row 2:** decided section 7 by availability rather than by the test. Native isolation would have
-  needed a token bound to one tunnel, and that cannot be created, so isolation comes from a
-  stateless broker in front of the account token (section 7). If Cloudflare later offers
-  tunnel-scoped tokens, `TestLiveScopedTokenHostnameRoutes` answers whether they cover hostname
-  routes, and the broker could be retired.
+- **Row 2:** decided section 7. Cloudflare cannot scope an API token to one tunnel, so native
+  isolation is not available and isolation comes from a stateless broker in front of the account
+  token (section 7). If Cloudflare later adds a tunnel-scoped permission,
+  `TestLiveScopedTokenHostnameRoutes` answers whether it covers hostname routes, and the broker
+  could be retired.
 - **Row 3:** a handoff's gap is one reconcile interval and nothing more.
 - **Row 4:** wildcards and exact routes can coexist across tunnels, so a wildcard can be taken by
   one instance without refusing another's exact route. See the known limitation in section 9 for
@@ -304,6 +414,48 @@ go test -tags=integration -v -count=1 \
 - **Row 6:** the owner tag must fit in 256 characters. Its prefix `managed-by=external-dns/` is 24, so
   an `OWNER_ID` can be at most 232 characters. A single-hostname lookup is also possible, which the
   409 classifier could use instead of listing the account.
+
+### The broker, live
+
+**MEASURED 2026-10-23**, on a deployment made for the purpose and torn down afterwards: two tunnels,
+two Access service tokens, one Access application, the Worker on `workers.dev`, and an upstream
+token that held only Cloudflare One Networks Read and Write and expired after three hours.
+`TestLiveBrokerThroughAccess` (`test/integration/broker_live_test.go`) drove it with the real Go
+client and provider and never held the account token. All seven subtests passed on the fourth run:
+
+| What was asked | What was observed |
+|---|---|
+| An authenticated list | `200` and no routes, on a fresh tunnel. The Worker verified the JWT Access issued, against the team's real keys, and found the client in its policy by `common_name`. |
+| A request with no service token | `403` from Access. It never reached the Worker. |
+| The provider creates a route | The route exists on the client's tunnel with the client's owner tag. |
+| A second client lists, then deletes the first's route | It does not see it. The delete is `404`, error `1107`, the same as for an unknown id. The route survives. |
+| A client names another client's tunnel, or retargets onto it | Both refused, `403`. |
+| Two clients want one hostname | Cloudflare's own `409`, error `1108`, passed through. The provider reports it pending and neither the holder's tunnel nor its owner id appears in the provider's log. |
+| Each client deletes its own routes | Succeeded. |
+
+Four runs were needed, and the first three failed for reasons no earlier test could have found:
+
+1. **Access answers a service-auth-only application with `403`, not a redirect to a login page.** A
+   probe that waited for a redirect to learn the team domain could never succeed. The team domain is
+   public and is in the domain of the organization's other Access applications.
+2. **Cloudflare error `1010`.** The Browser Integrity Check refused a Python client's default
+   `User-Agent` before Access or the Worker saw the request. A request with a named `User-Agent`
+   went through. The provider's client now sends one (`cloudflare.UserAgent`, replaceable with
+   `WithHeader`). Whether Go's default `Go-http-client` would have been refused as well was not
+   tested.
+3. **Cloudflare error `1101`: the Worker threw on every request.** The handler called
+   `deps.fetch(...)`, and the Workers runtime throws "Illegal invocation: function called with
+   incorrect this reference" for a `fetch` that is called as a method of another object. This was
+   reproduced in `wrangler dev`: `{ fetch }.fetch(url)` throws, while `const f = fetch; f(url)` and
+   `(i, n) => fetch(i, n)` both work. Node accepts all three, so 90 passing unit tests and the Go
+   end-to-end test could not see it. The handler now calls it detached, and a unit test mimics the
+   runtime's check; restoring the method call fails that test.
+
+A live account also moved while this ran: other external-dns instances on other tunnels created
+routes during the day. A route count taken before and after the runs is therefore not evidence about
+the runs. What was checked instead is that no resource named for the spike remained, by name rather
+than by the orchestrator's own record of ids: no tunnel, hostname route, Access application, service
+token, Worker script or account API token.
 
 ## 9. Not built, and why
 
@@ -325,8 +477,8 @@ go test -tags=integration -v -count=1 \
 - **A hostname-filtered lookup in the 409 classifier.** The list endpoint supports `hostname=`
   (section 8), so the classifier could fetch one route instead of listing the account. Not built:
   it costs one list per `ApplyChanges` and only when a create conflicts.
-- **A claim registry or broker (Worker plus Durable Object).** Not needed for correctness: the 409
-  is the mutex, the comment is the ownership record, and an owner's own delete is consent. A broker
-  would add deterministic first-come ordering among several claimants and a zero-gap
-  release-and-retarget. Revisit only if the gap of one interval proves unacceptable, or if
-  Cloudflare cannot scope an API token to a tunnel and the isolation in section 7 needs it.
+- **A stateful claim registry (a Durable Object behind the broker).** The stateless broker in
+  section 7 is built, for isolation. A registry is a different thing and is not needed for
+  correctness: the 409 is the mutex, the comment is the ownership record, and an owner's own delete
+  is consent. A registry would add deterministic first-come ordering among several claimants and a
+  zero-gap release-and-retarget. Revisit only if the gap of one interval proves unacceptable.
