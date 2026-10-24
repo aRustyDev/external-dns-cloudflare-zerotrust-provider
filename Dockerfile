@@ -3,7 +3,7 @@
 # Go (CGO_ENABLED=0), so Go targets another architecture natively. Running this stage under QEMU
 # instead made the arm64 half of a multi-arch build take about fifteen minutes. The final stage has
 # no RUN, so assembling either platform's image needs no emulation either.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src

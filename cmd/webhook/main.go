@@ -123,7 +123,14 @@ func main() {
 	}
 
 	// Blocks. Serves GET /, GET /records, POST /records, POST /adjustendpoints.
-	api.StartHTTPApi(p, nil, 5*time.Second, 10*time.Second, webhookListen)
+	// external-dns v0.23 takes one options struct. The fields left unset keep the previous behavior:
+	// ReadHeaderTimeout and IdleTimeout fall back to ReadTimeout, and no body size limit applies.
+	api.StartHTTPApi(api.ServerOptions{
+		Provider:     p,
+		ProviderPort: webhookListen,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	})
 }
 
 // serveHealth exposes liveness/readiness probes and the Prometheus /metrics endpoint.
