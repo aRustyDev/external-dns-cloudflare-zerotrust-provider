@@ -103,9 +103,11 @@ jobs:
 
   # A pull request never publishes (see release.yml). This is the part of the image pipeline that is
   # safe to run on one: lint the Dockerfile with BuildKit's own checks, then build it without pushing,
-  # so a broken Dockerfile fails here rather than after the merge. linux/amd64 only: the arm64 Go build
-  # and tests already run natively in build-test, and emulating arm64 is what made the old PR build take
-  # ten minutes or more. Nothing here logs in to a registry, signs, or writes the build cache.
+  # so a broken Dockerfile fails here rather than after the merge. Both platforms are built: the
+  # Dockerfile cross-compiles on the builder's own architecture, so arm64 needs no QEMU. That is also
+  # why this job sets none up, so it would fail here if a RUN ever needed emulation again. The cache
+  # is only read, never written: a build takes about a minute, and writing it from a PR costs more than
+  # it saves. Nothing here logs in to a registry or signs.
   docker:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -127,6 +129,6 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: false
           cache-from: type=gha
