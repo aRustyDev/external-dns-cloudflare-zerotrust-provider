@@ -467,6 +467,12 @@ release. Cut a release by pushing a semver tag:
 git tag v0.3.0 && git push origin v0.3.0   # builds, scans, signs, and drafts a GitHub release
 ```
 
+Release tags are protected. Two repository rulesets cover `refs/tags/v*`: only repository admins can
+create one, and once created a tag cannot be moved or deleted (no bypass; to remove one, edit the
+ruleset first). Rulesets cannot say which commit a tag may point at, so the release workflow checks it
+itself and **refuses a tag whose commit is not already on `main`**, before anything is published.
+Merge first, then tag the merged commit.
+
 `deploy/deployment.yaml` pins a released tag (not `:latest`). Bump the pin when you cut a new
 release. If you want **unauthenticated** image pulls, make the GHCR package public once
 (Package → Package settings → Change visibility → Public), or supply an `imagePullSecret`.
