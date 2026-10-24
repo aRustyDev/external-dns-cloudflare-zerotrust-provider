@@ -258,3 +258,29 @@ func TestClient_NoTokenSendsNoAuthorizationAndWithHeaderIsSent(t *testing.T) {
 		t.Errorf("Authorization = %q, want the bearer token", v)
 	}
 }
+
+// Go's default User-Agent is one Cloudflare's Browser Integrity Check can refuse (error 1010) once
+// a request crosses an Access-protected hostname, so the client always names itself, and a caller
+// can still replace the name.
+func TestClient_SendsANamedUserAgentThatWithHeaderCanReplace(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte(`{"success":true,"result":[],"result_info":{"page":1,"per_page":100,"count":0,"total_count":0}}`))
+	}))
+	defer srv.Close()
+
+	if _, err := New(acct, "tok", WithBaseURL(srv.URL)).ListHostnameRoutes(context.Background(), ""); err != nil {
+		t.Fatalf("ListHostnameRoutes: %v", err)
+	}
+	if got != UserAgent || strings.HasPrefix(got, "Go-http-client") {
+		t.Errorf("User-Agent = %q, want %q", got, UserAgent)
+	}
+
+	if _, err := New(acct, "tok", WithBaseURL(srv.URL), WithHeader("User-Agent", "custom/1")).ListHostnameRoutes(context.Background(), ""); err != nil {
+		t.Fatalf("ListHostnameRoutes: %v", err)
+	}
+	if got != "custom/1" {
+		t.Errorf("User-Agent = %q, want the WithHeader override", got)
+	}
+}

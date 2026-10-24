@@ -79,6 +79,9 @@ type Option func(*Client)
 // WithBaseURL overrides the API root (used in tests).
 func WithBaseURL(u string) Option { return func(c *Client) { c.BaseURL = u } }
 
+// UserAgent is sent on every request unless WithHeader replaces it.
+const UserAgent = "external-dns-cloudflare-zerotrust-provider"
+
 // WithHeader adds a header to every request. A repeated name is sent once, with the last value. It
 // exists so the client can speak to a broker that authenticates with Cloudflare Access service-token
 // headers instead of a bearer token.
@@ -146,6 +149,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	// A named User-Agent, because Go's default is one Cloudflare's Browser Integrity Check can refuse
+	// (error 1010) once a request crosses an Access-protected hostname. WithHeader can override it.
+	req.Header.Set("User-Agent", UserAgent)
 	for _, h := range c.headers {
 		req.Header.Set(h[0], h[1])
 	}
