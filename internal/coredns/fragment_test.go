@@ -288,7 +288,7 @@ func operationOwnsKey(t *testing.T, entries []metav1.ManagedFieldsEntry, manager
 			continue
 		}
 		var fields map[string]any
-		if err := json.Unmarshal(entry.FieldsV1.Raw, &fields); err != nil {
+		if err := json.Unmarshal(entry.FieldsV1.GetRawBytes(), &fields); err != nil {
 			t.Fatalf("decode managed fields for %s/%s: %v", manager, operation, err)
 		}
 		data, ok := fields["f:data"].(map[string]any)
