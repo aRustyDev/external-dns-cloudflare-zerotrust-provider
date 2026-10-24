@@ -1,0 +1,13 @@
+# The build context is what `go build ./cmd/webhook` reads, and nothing else. An allowlist, so the
+# `COPY . .` layer, and the compile after it, are reused until Go source or the module files
+# change, instead of being rebuilt for a docs, workflow or .git change. Add a directory here if the
+# webhook starts importing from a new one; the docker job in ci.yaml fails if one is missed.
+*
+!go.mod
+!go.sum
+!cmd
+!internal
+
+# Inside the allowed directories, files the compiler never reads.
+**/*_test.go
+**/testdata
