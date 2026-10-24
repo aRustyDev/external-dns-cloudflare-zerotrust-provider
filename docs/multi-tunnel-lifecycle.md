@@ -3,8 +3,7 @@
 How several instances of this provider share one Cloudflare account: how a hostname moves between
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
-**Status.** Sections 1 to 5 and 9 describe behavior that exists today, and so does most of section
-6. The one part of section 6 that is designed but not built says so. Section 7 (token isolation)
+**Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 7 (token isolation)
 and section 8 (live measurements) are added by the changes that produce them.
 
 ## 1. Scope and operator invariants
@@ -201,11 +200,27 @@ suppression under `operation="prune"`.
 
 Both log their hostnames once per change, not every reconcile.
 
-### `prune --owner <id>` subcommand (planned, not built)
+### The `prune --owner <id>` subcommand
 
-A dead instance cannot clean up after itself. The operator runs this with a token that covers that
-owner's tunnels. It lists by default and deletes only with `--apply`, and only routes tagged with
-that owner.
+A dead instance cannot clean up after itself: its owner id was renamed, its cluster is gone, or a
+tunnel was dropped from its configuration, so nothing inside the reconcile can reach those routes.
+The operator runs `webhook prune --owner <id>` from the same image, with a token that covers that
+owner's tunnels.
+
+- **It looks by default.** Nothing is deleted without `--apply`.
+- **Exact tag match.** It acts only on routes tagged `managed-by=external-dns/<id>`, using the
+  provider's own `RouteTaggedBy`, so the tag format has one definition. `x` does not match `xy` or
+  `x-prod`, and untagged routes and other owners' routes are never listed.
+- **Scope.** `--tunnel` limits which tunnels are listed, repeatable or comma-separated, and with
+  none it lists the whole account as far as the token can see. `--domain-filter` narrows further.
+- **Failures.** A failed delete is reported and does not stop the rest. Exit status is `0` on
+  success, `1` if a list or delete failed, `2` for bad usage. A failed list deletes nothing.
+- **It removes Cloudflare routes only.** The dead instance's CoreDNS rewrites live in its own
+  cluster.
+
+Running it against a live instance's owner id is an outage window for every route it deletes,
+because that instance recreates whatever it still desires on its next reconcile. The usage text and
+the README both say so.
 
 ## 9. Not built, and why
 

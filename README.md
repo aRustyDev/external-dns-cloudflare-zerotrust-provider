@@ -365,6 +365,39 @@ migrate. Until the create lands, in-cluster clients in Y's cluster already resol
 Service through the staged rewrite, while WARP clients still reach X. If you abandon the move
 before X releases the name, CoreDNS prune removes Y's staged rewrite on the next reconcile.
 
+### Cleaning up after a dead instance
+
+An instance that is gone cannot delete its routes: a renamed `OWNER_ID`, a decommissioned cluster,
+a tunnel dropped from the configuration. The binary has a one-shot subcommand for that. It lists by
+default and deletes nothing until you add `--apply`.
+
+```sh
+# Look first.
+docker run --rm -e CF_ACCOUNT_ID -e CF_API_TOKEN \
+  ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:<tag> prune --owner cluster-a
+
+# Then delete exactly what it listed.
+docker run --rm -e CF_ACCOUNT_ID -e CF_API_TOKEN \
+  ghcr.io/arustydev/external-dns-cloudflare-zerotrust-provider:<tag> prune --owner cluster-a --apply
+```
+
+| Flag | Meaning |
+|---|---|
+| `--owner <id>` | **Required.** Only routes tagged `managed-by=external-dns/<id>` exactly. Untagged routes and other owners' routes are never listed. |
+| `--tunnel <id>` | Only look at this tunnel. Repeatable or comma-separated. Omit it to list the whole account, as far as the token can see. |
+| `--domain-filter <suffix>,...` | Only routes whose hostname matches. |
+| `--apply` | Delete. Without it nothing is changed. |
+
+It exits `0` on success (including when there is nothing to prune), `1` if a list or delete failed
+(a failed delete does not stop the others), and `2` for bad flags or missing credentials.
+
+> **Only run it for an owner whose instance is no longer running.** A live instance recreates
+> anything it still desires on its next reconcile, which is an outage window for each of those
+> hostnames.
+
+This removes Cloudflare routes only. A dead instance's CoreDNS rewrites live in its own cluster's
+ConfigMap, so remove that key there if the cluster is still running.
+
 With `TUNNEL_MAP` and `COREDNS_CONFIGMAP` both set, every mapped tunnel must terminate in the
 cluster this instance writes CoreDNS for. The rewrite lives in one cluster and the route picks the
 tunnel, so a route on a tunnel in another cluster resolves nowhere.
