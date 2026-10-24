@@ -3,9 +3,9 @@
 How several instances of this provider share one Cloudflare account: how a hostname moves between
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
-**Status.** Sections 1 to 5 and 9 describe behavior that exists today. Section 6 describes work
-that is designed but not built, and says so. Section 7 (token isolation) and section 8 (live
-measurements) are added by the changes that produce them.
+**Status.** Sections 1 to 5 and 9 describe behavior that exists today, and so does most of section
+6. The one part of section 6 that is designed but not built says so. Section 7 (token isolation)
+and section 8 (live measurements) are added by the changes that produce them.
 
 ## 1. Scope and operator invariants
 
@@ -122,9 +122,10 @@ In dry run no create is attempted, so no conflict is observed and nothing is mar
 clients in Y's cluster then resolve the name to Y's Service while WARP clients still reach X.
 That is the price of keeping the handoff gap to one interval.
 
-**Known leak until section 6 lands.** If Y's annotation is removed before X releases the name, the
-host is in neither `Records` nor the desired set, so no delete is planned and nothing removes the
-staged rewrite. It stays in Y's fragment until an operator removes it.
+**An abandoned claim leaves a rewrite behind, and prune removes it.** If Y's annotation is removed
+before X releases the name, the host is in neither `Records` nor the desired set, so no delete is
+planned and nothing in the plan would remove the staged rewrite. CoreDNS prune (section 6) removes
+it on the next reconcile. With `COREDNS_PRUNE=false` it stays until an operator removes it.
 
 ## 5. Draining a tunnel and retargeting a route
 
@@ -162,18 +163,49 @@ body above has not been run against an account. `TestLiveRetargetPreservesRouteI
 If the API turns out not to retarget on `PATCH`, the fallback is a delete followed by a create in
 the same pass, which opens a short gap.
 
-## 6. Pruning (planned)
+## 6. Pruning and orphan visibility
 
-Not built.
+### CoreDNS prune, on by default
 
-- **CoreDNS prune, on by default.** Remove fragment entries that nothing owns or desires. The key
-  has exactly one writer, so such an entry is stale by construction. This closes the leak in
-  section 4 and the case of a route deleted out of band.
-- **`prune --owner <id>` subcommand.** A dead instance cannot clean up after itself. The operator
-  runs this with a token that covers that owner's tunnels. It lists by default and deletes only
-  with `--apply`, and only routes tagged with that owner.
-- **Visibility gauges** for owned routes that are no longer desired, or that fall outside the
-  domain filter.
+Remove fragment entries that nothing owns or wants. The key has exactly one writer, so such an entry
+is stale by construction. This closes the leak in section 4 and the case of a route deleted out of
+band. `COREDNS_PRUNE=false` turns it off.
+
+An entry is removed only when all four hold. Each guard exists because dropping it makes prune
+delete something it should not.
+
+| Guard | What it protects |
+|---|---|
+| No live route this instance manages carries the host, on any listed tunnel, counted before the domain filter | A rewrite whose route exists, whether or not a Service currently wants it. This is also what keeps a rewrite under `upsert-only`, which never deletes the route. |
+| No desired endpoint names the host | The staged rewrite of a host that is pending because another instance holds the name, and a host whose route is not created yet. |
+| The host is inside `DOMAIN_FILTER` | Names this instance was never configured to manage. In single-tunnel mode the resolver accepts every hostname, so this is the only guard there. |
+| The resolver still maps the host's domain to a tunnel | A domain that has left `TUNNEL_MAP`, whose routes may still exist on a tunnel that is no longer listed. |
+
+Prune also waits for a **complete `Records`**. `Records` clears a completeness flag when it starts
+and sets it only when it finishes, so a never-run or failed `Records` leaves the owned set unusable.
+Without this a freshly started instance holds an empty owned set and would delete every rewrite
+that is not currently wanted.
+
+A failure to read or write the ConfigMap is logged and counted but does not fail
+`AdjustEndpoints`. This is housekeeping, and a ConfigMap problem must not stop routes from being
+created or deleted. In dry run it logs `would PRUNE stale CoreDNS rewrites` and counts the
+suppression under `operation="prune"`.
+
+### Visibility gauges
+
+- `cfzt_provider_routes_undesired`: owned routes on a listed tunnel that no Service desires. Under
+  `--policy=sync` the plan deletes them, so it reads near zero after each cycle with a one-cycle
+  blip. Under `upsert-only` ExternalDNS never deletes them, so this is the only place they show.
+- `cfzt_provider_routes_out_of_filter`: owned routes on a listed tunnel outside `DOMAIN_FILTER`.
+  This instance never retargets or deletes these, so they only leave by hand.
+
+Both log their hostnames once per change, not every reconcile.
+
+### `prune --owner <id>` subcommand (planned, not built)
+
+A dead instance cannot clean up after itself. The operator runs this with a token that covers that
+owner's tunnels. It lists by default and deletes only with `--apply`, and only routes tagged with
+that owner.
 
 ## 9. Not built, and why
 

@@ -79,6 +79,9 @@ type FragmentWriter interface {
 	ServiceTarget(resource string) (string, error)
 	// Apply adds and removes rewrites, returning the resulting set.
 	Apply(ctx context.Context, add map[string]string, remove []string) (map[string]string, error)
+	// Load returns the rewrites currently in the managed key. Prune reads it to find entries that
+	// nothing owns or wants any more.
+	Load(ctx context.Context) (map[string]string, error)
 	// Key names the ConfigMap key being managed (for logs).
 	Key() string
 }
@@ -114,6 +117,20 @@ type Provider struct {
 	// requests from observing a partially replaced snapshot.
 	recordsHostsMu sync.RWMutex
 	recordsHosts   map[string]struct{}
+	// ownedHosts is every live route this instance may manage on a listed tunnel, counted BEFORE
+	// the domain filter, from the most recent successful Records. recordsOK says that snapshot is
+	// complete: Records clears it when it starts and sets it only when it finishes, so a failed or
+	// never-run Records leaves it false and prune declines to act on a partial view.
+	ownedHosts map[string]struct{}
+	recordsOK  bool
+
+	corednsPrune bool
+
+	// The hostname sets the orphan reports last logged, so a change is logged once instead of on
+	// every reconcile.
+	reportMu        sync.Mutex
+	lastUndesired   string
+	lastOutOfFilter string
 
 	// pending maps a lowercase hostname to why its create is being refused as already-routed
 	// (a metrics.Pending* reason). See setPending for its lifecycle.
@@ -152,7 +169,14 @@ type Config struct {
 	// CoreDNS, when non-nil, makes the provider ALSO own the in-cluster CoreDNS answer for every
 	// managed hostname, so one Service annotation drives both legs. Nil (the default) leaves the
 	// CoreDNS half to whatever manages it today.
-	CoreDNS      FragmentWriter
+	CoreDNS FragmentWriter
+	// CoreDNSPrune, when true and CoreDNS is set, removes fragment entries that nothing owns or
+	// wants: no live route this instance manages, and no desired endpoint. The key has exactly one
+	// writer, so such an entry is stale by construction. It closes the leak left when a pending
+	// host's annotation is removed before the holder releases it, and when a route is deleted out
+	// of band. Only hosts inside the domain filter that the resolver can still resolve are
+	// considered, and nothing is pruned until a complete Records has run.
+	CoreDNSPrune bool
 	DomainFilter []string
 	// Metrics is optional; nil disables metrics (all metric calls are no-ops).
 	Metrics *metrics.Metrics
@@ -203,6 +227,7 @@ func New(cfg Config) (*Provider, error) {
 		metrics:         cfg.Metrics,
 		log:             logger,
 		pending:         map[string]string{},
+		corednsPrune:    cfg.CoreDNSPrune,
 	}, nil
 }
 
@@ -251,7 +276,10 @@ func (p *Provider) manageable(r cloudflare.HostnameRoute) bool {
 // Records lists managed hostname routes across the configured tunnel(s) as CNAME endpoints.
 // It filters by domain filter and by ownership (see manageable).
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
+	p.markRecordsIncomplete()
 	var out []*endpoint.Endpoint
+	owned := map[string]struct{}{}
+	var outOfFilter []string
 	// Routes this instance manages on each listed tunnel, counted BEFORE the domain filter and
 	// including zeros. A draining tunnel reading 0 means it can be retired; counting only
 	// in-filter routes would read 0 while out-of-filter routes were still stranded on it.
@@ -273,7 +301,9 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 				continue
 			}
 			perTunnel[tid]++
+			owned[strings.ToLower(r.Hostname)] = struct{}{}
 			if !p.domainFilter.Match(r.Hostname) {
+				outOfFilter = append(outOfFilter, strings.ToLower(r.Hostname))
 				continue
 			}
 			out = append(out, endpoint.NewEndpoint(r.Hostname, recordType, target))
@@ -281,7 +311,10 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	}
 	p.metrics.SetRoutesByTunnel(perTunnel)
 	p.metrics.SetRecordsManaged(len(out))
-	p.rememberRecordHosts(out)
+	p.metrics.SetRoutesOutOfFilter(len(outOfFilter))
+	p.logSetChange(&p.lastOutOfFilter, outOfFilter, "routes this instance owns are outside the "+
+		"domain filter, so it will not retarget or delete them")
+	p.rememberRecordHosts(out, owned)
 	// A host that now appears here exists and is ours, so it is no longer waiting on anyone.
 	exists := p.recordHosts()
 	p.retainPending(func(host string) bool { _, ok := exists[host]; return !ok })
@@ -292,14 +325,54 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 // the current reconciliation. In ownership-strict mode that means only routes carrying this
 // provider's owner tag; CoreDNS is therefore never retargeted merely because some other writer
 // happens to own the same Cloudflare hostname route.
-func (p *Provider) rememberRecordHosts(records []*endpoint.Endpoint) {
+//
+// owned is every manageable live route on a listed tunnel before the domain filter. Calling this
+// is what marks the snapshot complete, so it must be the last step of a successful Records.
+func (p *Provider) rememberRecordHosts(records []*endpoint.Endpoint, owned map[string]struct{}) {
 	hosts := make(map[string]struct{}, len(records))
 	for _, ep := range records {
 		hosts[strings.ToLower(ep.DNSName)] = struct{}{}
 	}
 	p.recordsHostsMu.Lock()
 	p.recordsHosts = hosts
+	p.ownedHosts = owned
+	p.recordsOK = true
 	p.recordsHostsMu.Unlock()
+}
+
+// markRecordsIncomplete clears the completeness flag at the start of Records.
+func (p *Provider) markRecordsIncomplete() {
+	p.recordsHostsMu.Lock()
+	p.recordsOK = false
+	p.recordsHostsMu.Unlock()
+}
+
+// ownedSnapshot returns a copy of the owned set and whether it came from a complete Records.
+func (p *Provider) ownedSnapshot() (map[string]struct{}, bool) {
+	p.recordsHostsMu.RLock()
+	defer p.recordsHostsMu.RUnlock()
+	if !p.recordsOK {
+		return nil, false
+	}
+	owned := make(map[string]struct{}, len(p.ownedHosts))
+	for host := range p.ownedHosts {
+		owned[host] = struct{}{}
+	}
+	return owned, true
+}
+
+// logSetChange logs the sorted hostnames at Info, but only when the set differs from the one last
+// logged under the same key. The gauges carry the count every cycle; this carries the names, once.
+func (p *Provider) logSetChange(last *string, hosts []string, msg string) {
+	sort.Strings(hosts)
+	key := strings.Join(hosts, ",")
+	p.reportMu.Lock()
+	changed := key != *last
+	*last = key
+	p.reportMu.Unlock()
+	if changed && len(hosts) > 0 {
+		p.log.Info(msg, "count", len(hosts), "hostnames", hosts)
+	}
 }
 
 // recordHosts returns a copy so a reconciliation never holds the cache lock while calling the
@@ -364,7 +437,86 @@ func (p *Provider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.
 	if err := p.reconcileExistingCoreDNS(ctx, out); err != nil {
 		return nil, err
 	}
+	p.reportUndesired(desired)
+	p.pruneCoreDNS(ctx, desired)
 	return out, nil
+}
+
+// reportUndesired counts the routes this instance owns and lists on a tunnel that nothing desires
+// any more. Under --policy=sync the plan deletes them, so it reads near zero after each cycle;
+// under upsert-only ExternalDNS never deletes, so it is the only place they are visible.
+func (p *Provider) reportUndesired(desired map[string]struct{}) {
+	var undesired []string
+	for host := range p.recordHosts() {
+		if _, ok := desired[host]; !ok {
+			undesired = append(undesired, host)
+		}
+	}
+	p.metrics.SetRoutesUndesired(len(undesired))
+	p.logSetChange(&p.lastUndesired, undesired, "routes this instance owns are no longer desired by any Service")
+}
+
+// pruneCoreDNS removes fragment entries that nothing owns or wants. See Config.CoreDNSPrune.
+//
+// An entry is removed only when ALL of these hold: no live route this instance manages carries the
+// host (before the domain filter), no desired endpoint names it, it is inside the domain filter,
+// and the resolver still maps its domain to a tunnel. The last two keep prune away from names this
+// instance was never configured to manage, such as a domain that has left TUNNEL_MAP while its
+// routes may still exist on a tunnel that is no longer listed.
+//
+// It runs only after a complete Records. Without that, a freshly started instance holds an empty
+// owned set and would delete every rewrite that is not currently desired.
+//
+// A failure here is logged and counted but does not fail AdjustEndpoints: this is housekeeping, and
+// a ConfigMap problem must not stop routes from being created or deleted.
+func (p *Provider) pruneCoreDNS(ctx context.Context, desired map[string]struct{}) {
+	if p.coredns == nil || !p.corednsPrune {
+		return
+	}
+	owned, ok := p.ownedSnapshot()
+	if !ok {
+		return
+	}
+	current, err := p.coredns.Load(ctx)
+	if err != nil {
+		p.log.Warn("CoreDNS prune skipped: could not read the fragment", "key", p.coredns.Key(), "err", err)
+		return
+	}
+	var remove []string
+	for host := range current {
+		if _, ok := owned[host]; ok {
+			continue
+		}
+		if _, ok := desired[host]; ok {
+			continue
+		}
+		if !p.domainFilter.Match(host) {
+			continue
+		}
+		if _, ok := p.resolver.resolve(host); !ok {
+			continue
+		}
+		remove = append(remove, host)
+	}
+	if len(remove) == 0 {
+		return
+	}
+	sort.Strings(remove)
+	if p.dryRun {
+		p.log.Info("dry run: would PRUNE stale CoreDNS rewrites", "key", p.coredns.Key(), "remove", remove)
+		p.metrics.DryRunSkipped(metrics.OpPrune)
+		return
+	}
+	after, err := p.coredns.Apply(ctx, nil, remove)
+	p.metrics.CoreDNSWrite(err)
+	if err != nil {
+		p.log.Warn("CoreDNS prune failed", "key", p.coredns.Key(), "err", err)
+		return
+	}
+	p.metrics.SetCoreDNSRewrites(len(after))
+	p.metrics.CoreDNSPruned(len(remove))
+	p.log.Info("pruned stale CoreDNS rewrites: no route this instance manages and no Service wants them",
+		"key", p.coredns.Key(), "removed", remove, "rewrites", len(after))
 }
 
 // GetDomainFilter exposes the configured domain filter to ExternalDNS.

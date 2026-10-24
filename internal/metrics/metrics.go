@@ -41,6 +41,10 @@ const (
 // value for api_requests_total, which counts Cloudflare calls only.
 const OpFragment = "fragment"
 
+// OpPrune labels dry-run suppression of a CoreDNS prune, kept apart from OpFragment so a rehearsal
+// shows how many stale rewrites it would have removed, separately from ordinary rewrite writes.
+const OpPrune = "prune"
+
 // Reason label values for the routes_pending gauge: why a create was refused with "hostname
 // already routed" (Cloudflare error 1108) and is being retried on every reconcile.
 const (
@@ -61,20 +65,23 @@ var pendingReasons = []string{PendingSelf, PendingOther, PendingUntagged, Pendin
 
 // Metrics holds the provider's Prometheus collectors.
 type Metrics struct {
-	apiRequests    *prometheus.CounterVec
-	routesCreated  prometheus.Counter
-	routesDeleted  prometheus.Counter
-	routesAdopted  prometheus.Counter
-	applyDuration  prometheus.Histogram
-	recordsManaged prometheus.Gauge
-	dryRun         prometheus.Gauge
-	dryRunSkipped  *prometheus.CounterVec
-	corednsWrites  *prometheus.CounterVec
-	corednsRewrite prometheus.Gauge
-	routesPending  *prometheus.GaugeVec
-	listErrors     *prometheus.CounterVec
-	routesRetarget prometheus.Counter
-	routesByTunnel *prometheus.GaugeVec
+	apiRequests       *prometheus.CounterVec
+	routesCreated     prometheus.Counter
+	routesDeleted     prometheus.Counter
+	routesAdopted     prometheus.Counter
+	applyDuration     prometheus.Histogram
+	recordsManaged    prometheus.Gauge
+	dryRun            prometheus.Gauge
+	dryRunSkipped     *prometheus.CounterVec
+	corednsWrites     *prometheus.CounterVec
+	corednsRewrite    prometheus.Gauge
+	routesPending     *prometheus.GaugeVec
+	listErrors        *prometheus.CounterVec
+	routesRetarget    prometheus.Counter
+	routesByTunnel    *prometheus.GaugeVec
+	routesUndesired   prometheus.Gauge
+	routesOutOfFilter prometheus.Gauge
+	corednsPruned     prometheus.Counter
 }
 
 // New builds the collectors (unregistered). Call MustRegister to attach them to a registry.
@@ -137,6 +144,18 @@ func New() *Metrics {
 			Namespace: namespace, Subsystem: subsystem, Name: "routes_by_tunnel",
 			Help: "Live routes this instance manages on each tunnel it lists, regardless of the domain filter.",
 		}, []string{"tunnel_id"}),
+		routesUndesired: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "routes_undesired",
+			Help: "Routes this instance owns on a listed tunnel that no Service desires any more.",
+		}),
+		routesOutOfFilter: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "routes_out_of_filter",
+			Help: "Routes this instance owns on a listed tunnel that fall outside the domain filter.",
+		}),
+		corednsPruned: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: subsystem, Name: "coredns_pruned_total",
+			Help: "Stale CoreDNS rewrites removed because no route and no Service wanted them.",
+		}),
 	}
 }
 
@@ -157,6 +176,9 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.listErrors,
 		m.routesRetarget,
 		m.routesByTunnel,
+		m.routesUndesired,
+		m.routesOutOfFilter,
+		m.corednsPruned,
 	)
 }
 
@@ -298,4 +320,31 @@ func (m *Metrics) SetRoutesByTunnel(counts map[string]int) {
 	for tunnelID, n := range counts {
 		m.routesByTunnel.WithLabelValues(tunnelID).Set(float64(n))
 	}
+}
+
+// SetRoutesUndesired records how many owned routes on listed tunnels no Service desires. Under
+// --policy=sync it should read near zero after each cycle; under upsert-only it is the only place
+// such routes are visible, because ExternalDNS never deletes them.
+func (m *Metrics) SetRoutesUndesired(n int) {
+	if m == nil {
+		return
+	}
+	m.routesUndesired.Set(float64(n))
+}
+
+// SetRoutesOutOfFilter records how many owned routes on listed tunnels fall outside the domain
+// filter. This instance never retargets or deletes them, so they only ever leave by hand.
+func (m *Metrics) SetRoutesOutOfFilter(n int) {
+	if m == nil {
+		return
+	}
+	m.routesOutOfFilter.Set(float64(n))
+}
+
+// CoreDNSPruned adds n to the count of stale rewrites removed.
+func (m *Metrics) CoreDNSPruned(n int) {
+	if m == nil {
+		return
+	}
+	m.corednsPruned.Add(float64(n))
 }
