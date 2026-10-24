@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: build
         run: go build ./...
@@ -81,9 +81,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           # govulncheck scans against this toolchain's standard library. Without this the runner
-          # image's cached 1.26.x is used even after a fixed patch release exists.
+          # image's cached 1.27.x is used even after a fixed patch release exists.
           check-latest: true
           cache: true
       - name: gofmt
