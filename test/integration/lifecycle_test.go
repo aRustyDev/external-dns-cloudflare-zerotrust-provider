@@ -101,9 +101,7 @@ func TestLiveRetargetPreservesRouteID(t *testing.T) {
 	defer cancel()
 
 	created, err := c.CreateHostnameRoute(ctx, host, tunnelA, comment)
-	if err != nil {
-		t.Fatalf("create %q on tunnel A: %v", host, err)
-	}
+	requireCreate(t, "create "+host+" on tunnel A", err)
 	cleanupHost(t, c, host, tunnelA, tunnelB)
 	t.Logf("created route id=%s on tunnel A", created.ID)
 
@@ -149,9 +147,7 @@ func TestLiveProviderRetargetsFromADrainingTunnel(t *testing.T) {
 	defer cancel()
 
 	created, err := c.CreateHostnameRoute(ctx, host, tunnelA, "managed-by=external-dns/"+owner)
-	if err != nil {
-		t.Fatalf("create %q on tunnel A: %v", host, err)
-	}
+	requireCreate(t, "create "+host+" on tunnel A", err)
 	cleanupHost(t, c, host, tunnelA, tunnelB)
 
 	p, err := cfprovider.New(cfprovider.Config{

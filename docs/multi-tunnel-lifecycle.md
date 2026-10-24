@@ -3,8 +3,10 @@
 How several instances of this provider share one Cloudflare account: how a hostname moves between
 them, how dead routes are cleaned up, and how they avoid stepping on each other.
 
-**Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 7 (token isolation)
-and section 8 (live measurements) are added by the changes that produce them.
+**Status.** Sections 1 to 6 and 9 describe behavior that exists today. Section 8 records what a live
+run on 2026-10-23 measured: five of the six questions about Cloudflare's behavior are answered. The
+sixth, whether a token bound to one tunnel is enforced on hostname routes, could not be tested
+because no such token can be created, so section 7 designs a broker instead.
 
 ## 1. Scope and operator invariants
 
@@ -79,7 +81,8 @@ sibling waiting to claim it is blocked until the delete lands.
 3. **Y's next cycle**, at most one `--interval` later. The create succeeds. The rewrite was already
    staged, so CoreDNS reload latency is not on the critical path.
 
-The gap runs from step 2 to step 3. Lower `--interval` on Y for the duration of a migration. Under
+The gap runs from step 2 to step 3. Measured on 2026-10-23: a deleted route does not keep holding
+its hostname, so nothing is added to that bound (section 8, row 3). Lower `--interval` on Y for the duration of a migration. Under
 `upsert-only`, X never deletes, so the handoff never completes. That is the safe behavior while
 validating.
 
@@ -156,11 +159,14 @@ Retire a tunnel by moving it to `TUNNEL_DRAIN`, watching
 every live route this instance manages on the tunnel, including ones outside the domain filter,
 because counting only in-filter routes would read zero while routes were still stranded.
 
-**Not yet verified live.** That Cloudflare retargets on `PATCH`, keeps the route id, and accepts the
-body above has not been run against an account. `TestLiveRetargetPreservesRouteID` in
-`test/integration/` settles it, and also records whether a body with only `tunnel_id` is accepted.
-If the API turns out not to retarget on `PATCH`, the fallback is a delete followed by a create in
-the same pass, which opens a short gap.
+**Verified live on 2026-10-23.** `PATCH` retargets a route in place and keeps its id, whether the
+body is the full `{hostname, tunnel_id, comment}` or `tunnel_id` alone (section 8, row 1). The whole
+path, through ExternalDNS's real planner, moved a route off a draining tunnel in one reconcile. The
+delete-then-create fallback is therefore not needed and was not built.
+
+**A tunnel cannot be deleted while it has routes.** Cloudflare refuses with `400` and error `1023`
+until every route is removed (section 8, row 5), so draining a tunnel to zero is a precondition for
+deleting it, and deleting a tunnel can never orphan its routes.
 
 ## 6. Pruning and orphan visibility
 
@@ -222,6 +228,83 @@ Running it against a live instance's owner id is an outage window for every rout
 because that instance recreates whatever it still desires on its next reconcile. The usage text and
 the README both say so.
 
+## 8. Live measurements (spike)
+
+Six questions about Cloudflare's behavior shape this design. Each row below is either
+`MEASURED <date>` with what was observed, or `UNVERIFIED` with the reason. **Nothing here is
+inferred.** A row changes only when someone runs the test and pastes its `OBSERVED` lines.
+
+The tests need throwaway tunnels and skip without them. They record what the API does, and none
+of them fails because the API refused something. A token that cannot write hostname routes at all
+makes them skip with that reason instead.
+
+### What was measured (2026-10-23)
+
+Two runs against an account that already held 10 tunnels and 76 hostname routes, some of them
+production. Only tunnels and routes created for the runs were touched, and after each run the
+account was verified back to 10 tunnels and 76 routes.
+
+**Run 1, a token without a Networks permission.** It held Cloudflare One Connectors Read, Connector:
+WARP Read and Write, and Connector: cloudflared Read and Write.
+
+- Tunnels can be created and deleted with those permissions.
+- Hostname routes can be listed (HTTP 200).
+- Hostname routes cannot be created. Every `POST` returned `403` with error `10000`
+  ("Authentication error"). The connector and cloudflared permissions do not authorize writing
+  hostname routes; that needs a Cloudflare One Networks write permission, as the README already said
+  for the older Tunnel permission.
+
+**Run 2, the same token with Cloudflare One Networks Read and Write added.** Route creation worked
+and every test that could run passed. The results are in the table.
+
+**Also measured, read-only:** a hostname route can be fetched by id (`GET .../routes/hostname/{id}`
+returns `200` with `id`, `hostname`, `tunnel_id` and `comment`), and an unknown id returns `404` with
+error `1107`, "Hostname Route not found". The broker relies on both.
+
+A data point for row 2, not its answer: a token holding cloudflared Write was refused hostname-route
+creation, and creation worked only after an account-level Networks permission was added. That
+suggests hostname-route writes are governed by the Networks permission rather than by tunnel
+permissions. Row 2 still needs a token actually bound to one tunnel.
+
+```sh
+export CF_API_TOKEN=...  CF_ACCOUNT_ID=...   # the token needs Cloudflare One Networks write
+export CF_TUNNEL_ID=...        # throwaway tunnel A
+export CF_TUNNEL_ID_B=...      # throwaway tunnel B
+export CF_API_TOKEN_SCOPED=... # row 2: an Account API Token bound to a role on tunnel A only
+export CF_TUNNEL_ID_DISPOSABLE=...  # row 5: this tunnel is DELETED by the test
+go test -tags=integration -v -count=1 \
+  -run 'TestLive(RetargetPreservesRouteID|ScopedToken|SoftDelete|WildcardVsExact|TunnelDelete|ListFilters)' \
+  ./test/integration/ | grep OBSERVED
+```
+
+| # | Question | Test | What the docs say | Result |
+|---|---|---|---|---|
+| 1 | Does `PATCH` with `tunnel_id` retarget a route and keep its id? Is a body with only `tunnel_id` accepted? | `TestLiveRetargetPreservesRouteID`, `TestLiveProviderRetargetsFromADrainingTunnel` | The teamnet routes API documents `tunnel_id` on update. Nothing found for hostname routes. | **MEASURED 2026-10-23.** A `PATCH` with the full body `{hostname, tunnel_id, comment}` moved a route from tunnel A to tunnel B: same route id, listed on B and no longer on A. A `PATCH` with only `{tunnel_id}` was also accepted and moved it back, same id. The whole provider path (`Records`, `AdjustEndpoints`, ExternalDNS's planner, `ApplyChanges`) retargeted a route off a draining tunnel in one reconcile, same id. |
+| 2 | What can an API token bound to one tunnel do to hostname routes: list, create, patch and delete, on its own tunnel and on another? | `TestLiveScopedTokenHostnameRoutes` | Granular tunnel permissions shipped 2026-05-21. The enforced endpoints listed are `cfd_tunnel`, `warp_connector` and `teamnet/routes`. `zerotrust/routes/hostname` is not mentioned, and tokens are only said to "continue to function as before". | **UNVERIFIED by test, resolved by availability.** The test needs an API token bound to one tunnel, and none can be made. The account owner reported on 2026-10-23 that the dashboard offers no way to scope a token to specific tunnels. The spike token, which had Networks write, connector and Connectivity Directory permissions, got `403` (error `9109`) on both the list-tokens and list-permission-groups endpoints, so a token cannot be minted through the API with it either. Cloudflare's documentation offers tunnel scoping for member and permission policies, and lists only Access objects for resource-scoped API tokens. See the data point above. |
+| 3 | After a route is deleted, how long does its hostname stay refused with `1108`? | `TestLiveSoftDeleteWindow` | Not documented. The API soft-deletes (`deleted_at`). | **MEASURED 2026-10-23.** No window. Re-creating a hostname straight after deleting its route succeeded on the first attempt, 704 ms after the delete returned, as a new route id. `1108` was never returned. A soft-deleted route does not hold the name. |
+| 4 | How is a wildcard stored, and is an exact create under it on another tunnel refused? Which wins when a client resolves the name? | `TestLiveWildcardVsExact` | One leading wildcard label is allowed and stored without the `*`. Precedence against an exact route is undocumented. | **MEASURED 2026-10-23, API half.** A create for `*.<name>` succeeded and was stored as `<name>`, with the leading `*.` stripped. An exact create for `a.<name>` on a different tunnel then succeeded too, so a wildcard and an exact route can coexist and `1108` does not arbitrate between them. **UNVERIFIED:** which one wins when a client resolves the name, which needs a WARP client. |
+| 5 | What happens to a tunnel's hostname routes when the tunnel is deleted? | `TestLiveTunnelDeleteCascade` | Not documented. | **MEASURED 2026-10-23.** No cascade. Deleting a tunnel that has a hostname route was refused: `400`, error `1023`, "This tunnel has private network routes. Please remove all routes before deleting the tunnel." The route stayed. A tunnel with no routes deleted normally. |
+| 6 | Does the list endpoint filter by `hostname` and by `comment`? How long a comment is accepted? | `TestLiveListFiltersAndCommentLimit` | Neither a comment limit nor list filters are documented. | **MEASURED 2026-10-23.** Both filters work, on an exact match: `hostname=` returned exactly one route, and `comment=` returned exactly the routes carrying that comment. A 255-character comment was accepted and a 500-character one was refused with `400`, error `1112`, "Hostname Route comment cannot exceed 256 characters." |
+
+**What each answer decided.**
+
+- **Row 1:** retargeting is the in-place `PATCH` that exists today. The delete-then-create fallback
+  was not needed and was not built.
+- **Row 2:** decided section 7 by availability rather than by the test. Native isolation would have
+  needed a token bound to one tunnel, and that cannot be created, so isolation comes from a
+  stateless broker in front of the account token (section 7). If Cloudflare later offers
+  tunnel-scoped tokens, `TestLiveScopedTokenHostnameRoutes` answers whether they cover hostname
+  routes, and the broker could be retired.
+- **Row 3:** a handoff's gap is one reconcile interval and nothing more.
+- **Row 4:** wildcards and exact routes can coexist across tunnels, so a wildcard can be taken by
+  one instance without refusing another's exact route. See the known limitation in section 9 for
+  what the stored form means for the provider.
+- **Row 5:** a tunnel cannot be deleted until its routes are gone. Draining a tunnel to zero is the
+  way to retire it, and a tunnel delete can never orphan routes.
+- **Row 6:** the owner tag must fit in 256 characters. Its prefix `managed-by=external-dns/` is 24, so
+  an `OWNER_ID` can be at most 232 characters. A single-hostname lookup is also possible, which the
+  409 classifier could use instead of listing the account.
+
 ## 9. Not built, and why
 
 - **Rolling back a staged rewrite on a conflict.** Rejected. The rewrite is written again on the
@@ -230,6 +313,18 @@ the README both say so.
 - **A fast-retry loop inside the provider.** A webhook cannot trigger ExternalDNS reconciles, and a
   loop that creates from a stale snapshot can create a route for a Service that was just removed.
   The gap is bounded by `--interval`, which the runbook lowers.
+- **Wildcard hostnames are not supported, and they behave badly.** Cloudflare stores a wildcard
+  `*.<name>` as `<name>` (section 8, row 4), so `Records` reports `<name>` and no desired `*.<name>`
+  matches it. From reading the code, not from running it: under `--policy=sync` the plan would delete
+  `<name>` and create `*.<name>` every reconcile, and under `upsert-only` the create would be
+  refused as already routed and stay pending. With CoreDNS enabled a wildcard is refused up front,
+  because an exact rewrite cannot answer it. Do not annotate wildcard hostnames until this is
+  tested and handled.
+- **Validating `OWNER_ID` length.** Cloudflare refuses a comment over 256 characters, so an owner id
+  over 232 would fail every create with a `400`. Not built: owner ids are short in practice.
+- **A hostname-filtered lookup in the 409 classifier.** The list endpoint supports `hostname=`
+  (section 8), so the classifier could fetch one route instead of listing the account. Not built:
+  it costs one list per `ApplyChanges` and only when a create conflicts.
 - **A claim registry or broker (Worker plus Durable Object).** Not needed for correctness: the 409
   is the mutex, the comment is the ownership record, and an owner's own delete is consent. A broker
   would add deterministic first-come ordering among several claimants and a zero-gap
