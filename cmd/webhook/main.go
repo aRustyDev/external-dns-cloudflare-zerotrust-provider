@@ -38,6 +38,10 @@ import (
 	cfprovider "github.com/arustydev/external-dns-cloudflare-zerotrust-provider/internal/provider"
 )
 
+// defaultOwnerID is the owner tag used when OWNER_ID is unset. It is fine for a single instance
+// and wrong for two: instances sharing an owner tag treat each other's routes as their own.
+const defaultOwnerID = "default"
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
@@ -54,7 +58,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ownerID := envOr("OWNER_ID", "default")
+	ownerID := envOr("OWNER_ID", defaultOwnerID)
 	ownershipStrict := envBool("OWNERSHIP_STRICT", true)
 	dryRun := envBool("DRY_RUN", false)
 	adoptUntagged := envBool("ADOPT_UNTAGGED", false)
@@ -110,6 +114,12 @@ func main() {
 		log.Warn("ADOPT_UNTAGGED=true: a create for a hostname that already has a route will " +
 			"CLAIM that route by rewriting its comment, taking ownership from whatever created it " +
 			"(e.g. Terraform). The route id and tunnel binding are unchanged, so DNS never breaks.")
+	}
+
+	if ownerID == defaultOwnerID {
+		log.Warn("OWNER_ID is \"default\". That is only safe with ONE instance per account: every " +
+			"instance must use a unique OWNER_ID, or instances sharing one will treat each other's " +
+			"routes as their own and delete them under --policy=sync.")
 	}
 
 	// Blocks. Serves GET /, GET /records, POST /records, POST /adjustendpoints.

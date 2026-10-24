@@ -29,7 +29,8 @@
 // Ownership: routes are tagged with a "managed-by=external-dns/<owner>" comment. In
 // ownership-strict mode the provider only ever reads back and deletes routes carrying its own
 // owner tag, so it cannot disturb routes created by Terraform or by hand — important where an
-// external system (e.g. Terraform) is the declared sole owner of some `.private` routes.
+// external system (e.g. Terraform) is the declared sole owner of some `.private` routes. In every
+// mode it leaves routes tagged by a DIFFERENT owner alone.
 //
 // Dry run: ExternalDNS's own --dry-run flag is silently INERT for webhook providers (see
 // docs/upstream-dry-run-gap.md), so this provider implements its own DryRun, which is the only
@@ -38,8 +39,10 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -110,6 +113,11 @@ type Provider struct {
 	// requests from observing a partially replaced snapshot.
 	recordsHostsMu sync.RWMutex
 	recordsHosts   map[string]struct{}
+
+	// pending maps a lowercase hostname to why its create is being refused as already-routed
+	// (a metrics.Pending* reason). See setPending for its lifecycle.
+	pendingMu sync.Mutex
+	pending   map[string]string
 }
 
 // Config configures a Provider.
@@ -172,6 +180,7 @@ func New(cfg Config) (*Provider, error) {
 	// Publish the gauge at construction so it reads correctly from the first scrape, not just
 	// after the first reconcile.
 	cfg.Metrics.SetDryRun(cfg.DryRun)
+	cfg.Metrics.SetRoutesPending(nil)
 	return &Provider{
 		BaseProvider:    &extprovider.BaseProvider{},
 		client:          cfg.Client,
@@ -184,6 +193,7 @@ func New(cfg Config) (*Provider, error) {
 		domainFilter:    endpoint.NewDomainFilter(cfg.DomainFilter),
 		metrics:         cfg.Metrics,
 		log:             logger,
+		pending:         map[string]string{},
 	}, nil
 }
 
@@ -214,14 +224,30 @@ func (p *Provider) owns(r cloudflare.HostnameRoute) bool {
 	return managed && owner == p.ownerID
 }
 
+// manageable reports whether this instance may read back, delete or retarget the route.
+//
+// A route tagged by ANOTHER external-dns owner is never manageable, in any mode: that tag is the
+// only record of who created it, and acting on it would let one instance delete a sibling's
+// routes. A route carrying no tag at all (Terraform, hand-created) is manageable only when
+// ownership-strict mode is off. Our own tag is always manageable. This mirrors adopt(), which
+// refuses to claim another owner's route for the same reason.
+func (p *Provider) manageable(r cloudflare.HostnameRoute) bool {
+	owner, managed := routeOwner(r.Comment)
+	if managed {
+		return owner == p.ownerID
+	}
+	return !p.ownershipStrict
+}
+
 // Records lists managed hostname routes across the configured tunnel(s) as CNAME endpoints.
-// It filters by domain filter and, in ownership-strict mode, by owner tag.
+// It filters by domain filter and by ownership (see manageable).
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	var out []*endpoint.Endpoint
 	for _, tid := range p.resolver.tunnels() {
 		routes, err := p.client.ListHostnameRoutes(ctx, tid)
 		p.metrics.APIRequest(metrics.OpList, err)
 		if err != nil {
+			p.metrics.ListError(tid)
 			return nil, err
 		}
 		target := p.resolver.target(tid)
@@ -232,7 +258,7 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 			if !p.domainFilter.Match(r.Hostname) {
 				continue
 			}
-			if p.ownershipStrict && !p.owns(r) {
+			if !p.manageable(r) {
 				continue
 			}
 			out = append(out, endpoint.NewEndpoint(r.Hostname, recordType, target))
@@ -240,6 +266,9 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	}
 	p.metrics.SetRecordsManaged(len(out))
 	p.rememberRecordHosts(out)
+	// A host that now appears here exists and is ours, so it is no longer waiting on anyone.
+	exists := p.recordHosts()
+	p.retainPending(func(host string) bool { _, ok := exists[host]; return !ok })
 	return out, nil
 }
 
@@ -296,6 +325,13 @@ func (p *Provider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.
 		}
 		out = append(out, adjusted)
 	}
+	// A pending host whose annotation was removed is no longer waiting for anything. ExternalDNS
+	// plans no create for it, so ApplyChanges would never run again to clear it.
+	desired := make(map[string]struct{}, len(out))
+	for _, ep := range out {
+		desired[strings.ToLower(ep.DNSName)] = struct{}{}
+	}
+	p.retainPending(func(host string) bool { _, ok := desired[host]; return ok })
 	// ExternalDNS deliberately ignores endpoint labels while calculating its route plan. That is
 	// normally useful here: every desired endpoint canonicalizes to the same tunnel CNAME as an
 	// existing route, so replacing a Service leaves the Cloudflare plan empty. The resource label
@@ -320,8 +356,26 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 	return p.domainFilter
 }
 
-// ApplyChanges creates/deletes hostname routes to satisfy the plan. Updates are no-ops: a
+// ApplyChanges deletes and creates hostname routes to satisfy the plan. Updates are no-ops: a
 // route is just a hostname->tunnel binding with no mutable attributes this provider manages.
+//
+// Failures are PER HOST. A hostname that cannot be applied (no resource label, no tunnel for its
+// domain, a refused adoption, an API error) is reported and skipped, and every other change in
+// the batch still proceeds. The returned error joins the per-host failures.
+//
+// A create that Cloudflare refuses as "hostname already routed" (error 1108) is deliberately NOT
+// a failure. It means another writer holds the name, which is the normal state of a handoff
+// between two instances, so the host is recorded as pending: logged with the reason, counted in
+// routes_pending, and retried on every reconcile because ExternalDNS plans it again. Returning
+// it as an error would make the webhook answer 500 and push ExternalDNS's error counters up for
+// as long as the handoff takes, burying real failures.
+//
+// Deletes run BEFORE creates, so a name this instance gives up is released as early as possible:
+// a sibling waiting to claim it is blocked until the delete lands, and the creates can spend a
+// while on API calls first. The per-host handling above is what removes the old deadlock, where
+// two instances swapping hostnames each aborted on a 409 before reaching their delete; this
+// ordering only shortens the wait. The CoreDNS fragment is still written first of all (see
+// applyCoreDNS), so that ordering is unaffected.
 //
 // With AdoptUntagged enabled, a create whose hostname already has a route CLAIMS that route
 // (comment PATCH) rather than failing — see adopt.
@@ -329,7 +383,8 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 // In dry-run mode the gate sits at each mutating call rather than at the top of the function.
 // That is deliberate: the domain filter, tunnel resolution, ownership filtering and the
 // hostname->route-id lookup all still run, so the logged plan reflects what would really happen
-// and misconfiguration (e.g. a hostname with no configured tunnel) still fails loudly.
+// and misconfiguration (e.g. a hostname with no configured tunnel) still fails loudly. A create
+// is never attempted in dry-run, so no conflict is observed and nothing is marked pending.
 func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
 	if changes == nil || (len(changes.Create) == 0 && len(changes.Delete) == 0) {
 		return nil
@@ -337,26 +392,16 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 	start := time.Now()
 	defer func() { p.metrics.ObserveApply(time.Since(start).Seconds()) }()
 
-	// Build hostname -> route-id from the live set once, for deletes. In ownership-strict mode
-	// only our own routes are eligible, so we never delete Terraform-owned / hand-created ones.
-	byHost := map[string]string{}
+	// Build hostname -> route from the live set once, for deletes. Only routes this instance may
+	// manage are eligible (see manageable), so we never delete Terraform-owned, hand-created or
+	// sibling-owned ones.
+	var index map[string]cloudflare.HostnameRoute
 	if len(changes.Delete) > 0 {
-		for _, tid := range p.resolver.tunnels() {
-			routes, err := p.client.ListHostnameRoutes(ctx, tid)
-			p.metrics.APIRequest(metrics.OpList, err)
-			if err != nil {
-				return fmt.Errorf("list routes for delete: %w", err)
-			}
-			for _, r := range routes {
-				if r.DeletedAt != nil {
-					continue
-				}
-				if p.ownershipStrict && !p.owns(r) {
-					continue
-				}
-				byHost[strings.ToLower(r.Hostname)] = r.ID
-			}
+		idx, err := p.ownedRouteIndex(ctx)
+		if err != nil {
+			return err
 		}
+		index = idx
 	}
 
 	// Adoption must see routes this instance does NOT own, so this index is built WITHOUT the
@@ -365,37 +410,79 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 	// simply create over: we either claim it in place or leave it alone and say why.
 	var existing map[string]cloudflare.HostnameRoute
 	if p.adoptUntagged && len(changes.Create) > 0 {
-		existing = map[string]cloudflare.HostnameRoute{}
-		for _, tid := range p.resolver.tunnels() {
-			routes, err := p.client.ListHostnameRoutes(ctx, tid)
-			p.metrics.APIRequest(metrics.OpList, err)
-			if err != nil {
-				return fmt.Errorf("list routes for adoption: %w", err)
-			}
-			for _, r := range routes {
-				if r.DeletedAt != nil {
-					continue
-				}
-				existing[strings.ToLower(r.Hostname)] = r
-			}
+		idx, err := p.adoptionIndex(ctx)
+		if err != nil {
+			return err
 		}
+		existing = idx
 	}
 
-	if err := p.applyCoreDNS(ctx, changes); err != nil {
+	skipped, err := p.applyCoreDNS(ctx, changes)
+	if err != nil {
 		return err
 	}
 
-	for _, ep := range changes.Create {
+	errs := skippedErrors(skipped)
+	errs = append(errs, p.applyDeletes(ctx, changes.Delete, index)...)
+	errs = append(errs, p.applyCreates(ctx, changes.Create, existing, skipped)...)
+	return errors.Join(errs...)
+}
+
+// applyDeletes deletes the routes the plan removes, returning one error per host that failed.
+func (p *Provider) applyDeletes(ctx context.Context, deletes []*endpoint.Endpoint, index map[string]cloudflare.HostnameRoute) []error {
+	var errs []error
+	for _, ep := range deletes {
 		if !p.domainFilter.Match(ep.DNSName) {
+			continue
+		}
+		r, ok := index[strings.ToLower(ep.DNSName)]
+		if !ok {
+			continue // already gone, or not manageable by this instance
+		}
+		if p.dryRun {
+			p.log.Info("dry run: would DELETE hostname route", "hostname", ep.DNSName, "route_id", r.ID)
+			p.metrics.DryRunSkipped(metrics.OpDelete)
+			continue
+		}
+		err := p.client.DeleteHostnameRoute(ctx, r.ID)
+		p.metrics.APIRequest(metrics.OpDelete, err)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("delete route %q: %w", ep.DNSName, err))
+			continue
+		}
+		p.metrics.RouteDeleted()
+	}
+	return errs
+}
+
+// applyCreates creates the routes the plan adds, returning one error per host that failed. A host
+// in skipped already failed in applyCoreDNS and is left alone, so it gets neither a rewrite nor a
+// route. A create refused as already-routed is recorded as pending, not returned.
+func (p *Provider) applyCreates(ctx context.Context, creates []*endpoint.Endpoint,
+	existing map[string]cloudflare.HostnameRoute, skipped map[string]error) []error {
+	var errs []error
+
+	// Naming the holder of a conflicting hostname needs an account-wide list. Do it lazily and at
+	// most once per call, however many hostnames conflict.
+	var accountRoutes map[string]cloudflare.HostnameRoute
+	accountListed := false
+
+	for _, ep := range creates {
+		if !p.domainFilter.Match(ep.DNSName) {
+			continue
+		}
+		host := strings.ToLower(ep.DNSName)
+		if _, bad := skipped[host]; bad {
 			continue
 		}
 		tid, ok := p.resolver.resolve(ep.DNSName)
 		if !ok {
-			return fmt.Errorf("no tunnel configured for hostname %q", ep.DNSName)
+			errs = append(errs, fmt.Errorf("no tunnel configured for hostname %q", ep.DNSName))
+			continue
 		}
-		if r, found := existing[strings.ToLower(ep.DNSName)]; found {
+		if r, found := existing[host]; found {
 			if err := p.adopt(ctx, r, tid); err != nil {
-				return err
+				errs = append(errs, err)
 			}
 			continue
 		}
@@ -409,40 +496,199 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		p.metrics.APIRequest(metrics.OpCreate, err)
 		if err != nil {
 			// Reachable even with adoption enabled: another writer can claim the hostname
-			// between the list above and this create.
+			// between the list above and this create. Cloudflare's per-account uniqueness is the
+			// mutex; losing it is a state to wait out, not a failure.
 			if cloudflare.HasCode(err, cloudflare.ErrCodeHostnameAlreadyRouted) {
-				return fmt.Errorf("create route %q: hostname is already routed in Cloudflare "+
-					"(error %d — note its message says \"another tunnel\" even when the existing "+
-					"route is on the SAME tunnel). Set ADOPT_UNTAGGED=true to claim the existing "+
-					"route in place instead of recreating it: %w",
-					ep.DNSName, cloudflare.ErrCodeHostnameAlreadyRouted, err)
+				if !accountListed {
+					accountRoutes = p.accountRouteIndex(ctx)
+					accountListed = true
+				}
+				r, found := accountRoutes[host]
+				p.setPending(host, p.classifyConflict(ep.DNSName, tid, r, found))
+				continue
 			}
-			return fmt.Errorf("create route %q: %w", ep.DNSName, err)
+			errs = append(errs, fmt.Errorf("create route %q: %w", ep.DNSName, err))
+			continue
 		}
+		p.clearPending(host)
 		p.metrics.RouteCreated()
 	}
+	return errs
+}
 
-	for _, ep := range changes.Delete {
-		if !p.domainFilter.Match(ep.DNSName) {
-			continue
-		}
-		id, ok := byHost[strings.ToLower(ep.DNSName)]
-		if !ok {
-			continue // already gone, or not owned by us in strict mode
-		}
-		if p.dryRun {
-			p.log.Info("dry run: would DELETE hostname route", "hostname", ep.DNSName, "route_id", id)
-			p.metrics.DryRunSkipped(metrics.OpDelete)
-			continue
-		}
-		err := p.client.DeleteHostnameRoute(ctx, id)
-		p.metrics.APIRequest(metrics.OpDelete, err)
-		if err != nil {
-			return fmt.Errorf("delete route %q: %w", ep.DNSName, err)
-		}
-		p.metrics.RouteDeleted()
+// classifyConflict explains why a create was refused as already-routed, logs what the operator
+// can do about it, and returns the metrics reason. r is the live route holding the hostname when
+// found. It is the only place the holder is named, and it names the holder's owner only at Debug:
+// instances are expected to share an account, and who holds a name is not for another tenant's
+// logs.
+func (p *Provider) classifyConflict(host, wantTunnel string, r cloudflare.HostnameRoute, found bool) string {
+	if !found {
+		p.log.Info("hostname route not created: the hostname is already routed in Cloudflare, but no "+
+			"live route was found for it (it may be mid-delete, or on a tunnel this token cannot see); "+
+			"retrying every reconcile", "hostname", host, "tunnel_id", wantTunnel)
+		return metrics.PendingUnknown
 	}
-	return nil
+	owner, managed := routeOwner(r.Comment)
+	switch {
+	case p.owns(r) && r.TunnelID == wantTunnel:
+		p.log.Info("hostname route not created: this owner already routes it on the wanted tunnel "+
+			"(a concurrent reconcile created it); the next Records() will see it",
+			"hostname", host, "tunnel_id", wantTunnel, "route_id", r.ID)
+		return metrics.PendingSelf
+	case p.owns(r):
+		p.log.Info("hostname route not created: THIS owner already routes it on a tunnel this "+
+			"instance does not list, and nothing will release it; add that tunnel to TUNNEL_MAP "+
+			"so it is listed, or remove the route", "hostname", host, "wanted_tunnel_id", wantTunnel,
+			"held_on_tunnel_id", r.TunnelID, "route_id", r.ID)
+		return metrics.PendingSelf
+	case managed:
+		p.log.Info("hostname route not created: another external-dns owner holds the hostname; "+
+			"it will be created once that owner releases it", "hostname", host, "tunnel_id", wantTunnel)
+		p.log.Debug("conflicting route owner", "hostname", host, "owner", owner, "route_id", r.ID)
+		return metrics.PendingOther
+	default:
+		if r.TunnelID == wantTunnel {
+			p.log.Info("hostname route not created: a route with no owner tag already exists on the "+
+				"wanted tunnel; set ADOPT_UNTAGGED=true to claim it in place",
+				"hostname", host, "tunnel_id", wantTunnel, "route_id", r.ID)
+		} else {
+			p.log.Info("hostname route not created: a route with no owner tag holds the hostname on "+
+				"another tunnel; it will be created once that route is removed",
+				"hostname", host, "wanted_tunnel_id", wantTunnel, "held_on_tunnel_id", r.TunnelID)
+		}
+		return metrics.PendingUntagged
+	}
+}
+
+// pending bookkeeping. A host is pending from the reconcile whose create was refused until there
+// is evidence it is no longer waiting: it was created, it now appears in Records (so it exists and
+// is ours), or it is no longer desired (its annotation was removed). The last two are what stop
+// the gauge sticking at its old value when ExternalDNS plans nothing and never calls ApplyChanges
+// again for that host.
+
+func (p *Provider) setPending(host, reason string) {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	p.pending[host] = reason
+	p.publishPendingLocked()
+}
+
+func (p *Provider) clearPending(host string) {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	if _, ok := p.pending[host]; !ok {
+		return
+	}
+	delete(p.pending, host)
+	p.publishPendingLocked()
+}
+
+// retainPending drops every pending host for which keep returns false.
+func (p *Provider) retainPending(keep func(host string) bool) {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	changed := false
+	for host := range p.pending {
+		if !keep(host) {
+			delete(p.pending, host)
+			changed = true
+		}
+	}
+	if changed {
+		p.publishPendingLocked()
+	}
+}
+
+func (p *Provider) publishPendingLocked() {
+	counts := map[string]int{}
+	for _, reason := range p.pending {
+		counts[reason]++
+	}
+	p.metrics.SetRoutesPending(counts)
+}
+
+// ownedRouteIndex lists every configured tunnel and returns the live routes this instance may
+// delete, keyed by lowercase hostname (see manageable for what is eligible). The value is the
+// whole route, not just its id, so callers can also see which tunnel it is on.
+func (p *Provider) ownedRouteIndex(ctx context.Context) (map[string]cloudflare.HostnameRoute, error) {
+	index := map[string]cloudflare.HostnameRoute{}
+	for _, tid := range p.resolver.tunnels() {
+		routes, err := p.client.ListHostnameRoutes(ctx, tid)
+		p.metrics.APIRequest(metrics.OpList, err)
+		if err != nil {
+			p.metrics.ListError(tid)
+			return nil, fmt.Errorf("list routes for delete: %w", err)
+		}
+		for _, r := range routes {
+			if r.DeletedAt != nil {
+				continue
+			}
+			if !p.manageable(r) {
+				continue
+			}
+			index[strings.ToLower(r.Hostname)] = r
+		}
+	}
+	return index, nil
+}
+
+// adoptionIndex lists every configured tunnel and returns ALL live routes on them, whoever owns
+// them, keyed by lowercase hostname. adopt needs to see routes it must refuse.
+func (p *Provider) adoptionIndex(ctx context.Context) (map[string]cloudflare.HostnameRoute, error) {
+	index := map[string]cloudflare.HostnameRoute{}
+	for _, tid := range p.resolver.tunnels() {
+		routes, err := p.client.ListHostnameRoutes(ctx, tid)
+		p.metrics.APIRequest(metrics.OpList, err)
+		if err != nil {
+			p.metrics.ListError(tid)
+			return nil, fmt.Errorf("list routes for adoption: %w", err)
+		}
+		for _, r := range routes {
+			if r.DeletedAt != nil {
+				continue
+			}
+			index[strings.ToLower(r.Hostname)] = r
+		}
+	}
+	return index, nil
+}
+
+// accountRouteIndex lists every live route the token can see in the account, keyed by lowercase
+// hostname. It exists only to name the holder of a conflicting hostname, so a failure is logged
+// and yields an empty index instead of an error: being unable to explain a conflict must never
+// turn a pending host into a failed batch. Under a token scoped to this instance's tunnels the
+// list simply omits other tunnels' routes, which classifyConflict reports as unknown.
+func (p *Provider) accountRouteIndex(ctx context.Context) map[string]cloudflare.HostnameRoute {
+	index := map[string]cloudflare.HostnameRoute{}
+	routes, err := p.client.ListHostnameRoutes(ctx, "")
+	p.metrics.APIRequest(metrics.OpList, err)
+	if err != nil {
+		p.metrics.ListError("account")
+		p.log.Debug("could not list the account's routes to classify a conflict", "err", err)
+		return index
+	}
+	for _, r := range routes {
+		if r.DeletedAt != nil {
+			continue
+		}
+		index[strings.ToLower(r.Hostname)] = r
+	}
+	return index
+}
+
+// skippedErrors returns the per-host errors from applyCoreDNS in hostname order, so the joined
+// error text is deterministic.
+func skippedErrors(skipped map[string]error) []error {
+	hosts := make([]string, 0, len(skipped))
+	for host := range skipped {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	errs := make([]error, 0, len(hosts))
+	for _, host := range hosts {
+		errs = append(errs, skipped[host])
+	}
+	return errs
 }
 
 // applyCoreDNS writes the in-cluster leg for this plan, in ONE server-side apply, BEFORE any
@@ -460,27 +706,41 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 // Both orderings leave a brief window where a hostname has one leg and not the other; that window
 // is unavoidable (a route without an answer and an answer without a route both fail to resolve).
 // Only convergence-after-failure distinguishes them.
-func (p *Provider) applyCoreDNS(ctx context.Context, changes *plan.Changes) error {
+//
+// A host that cannot be answered (no resource label, a resource that is not a Service, a wildcard
+// name that an exact rewrite cannot match) is returned in skipped and gets no rewrite; the caller
+// must also not create its route. The other hosts in the batch are still written. The error
+// return is reserved for the fragment write itself failing, which aborts the whole batch.
+func (p *Provider) applyCoreDNS(ctx context.Context, changes *plan.Changes) (map[string]error, error) {
 	if p.coredns == nil {
-		return nil
+		return nil, nil
 	}
 
+	skipped := map[string]error{}
 	add := map[string]string{}
 	for _, ep := range changes.Create {
 		if !p.domainFilter.Match(ep.DNSName) {
 			continue
 		}
+		host := strings.ToLower(ep.DNSName)
+		if strings.Contains(host, "*") {
+			skipped[host] = fmt.Errorf("cannot write the CoreDNS answer for wildcard hostname %q: "+
+				"a CoreDNS \"rewrite name exact\" rule cannot match a wildcard", ep.DNSName)
+			continue
+		}
 		resource := ep.Labels[endpoint.ResourceLabelKey]
 		if resource == "" {
-			return fmt.Errorf("cannot write the CoreDNS answer for %q: the endpoint carries no %q "+
+			skipped[host] = fmt.Errorf("cannot write the CoreDNS answer for %q: the endpoint carries no %q "+
 				"label, so the backing Service is unknown (ExternalDNS sets it for --source=service)",
 				ep.DNSName, endpoint.ResourceLabelKey)
+			continue
 		}
-		target, err := p.coredns.ServiceTarget(resource)
-		if err != nil {
-			return fmt.Errorf("CoreDNS answer for %q: %w", ep.DNSName, err)
+		target, terr := p.coredns.ServiceTarget(resource)
+		if terr != nil {
+			skipped[host] = fmt.Errorf("CoreDNS answer for %q: %w", ep.DNSName, terr)
+			continue
 		}
-		add[strings.ToLower(ep.DNSName)] = target
+		add[host] = target
 	}
 
 	// Deletes are listed unconditionally rather than filtered by ownership: we only ever ADD
@@ -494,24 +754,24 @@ func (p *Provider) applyCoreDNS(ctx context.Context, changes *plan.Changes) erro
 	}
 
 	if len(add) == 0 && len(remove) == 0 {
-		return nil
+		return skipped, nil
 	}
 	if p.dryRun {
 		p.log.Info("dry run: would UPDATE the CoreDNS fragment",
 			"key", p.coredns.Key(), "add", add, "remove", remove)
 		p.metrics.DryRunSkipped(metrics.OpFragment)
-		return nil
+		return skipped, nil
 	}
 
-	after, err := p.coredns.Apply(ctx, add, remove)
-	p.metrics.CoreDNSWrite(err)
-	if err != nil {
-		return fmt.Errorf("update CoreDNS fragment %q: %w", p.coredns.Key(), err)
+	after, aerr := p.coredns.Apply(ctx, add, remove)
+	p.metrics.CoreDNSWrite(aerr)
+	if aerr != nil {
+		return nil, fmt.Errorf("update CoreDNS fragment %q: %w", p.coredns.Key(), aerr)
 	}
 	p.metrics.SetCoreDNSRewrites(len(after))
 	p.log.Info("updated CoreDNS fragment", "key", p.coredns.Key(),
 		"added", len(add), "removed", len(remove), "rewrites", len(after))
-	return nil
+	return skipped, nil
 }
 
 // reconcileExistingCoreDNS applies desired Service targets only for hostnames already exposed
@@ -522,6 +782,10 @@ func (p *Provider) applyCoreDNS(ctx context.Context, changes *plan.Changes) erro
 // It intentionally does not remove names absent from desired endpoints. Deletion remains driven
 // by ExternalDNS's policy-filtered plan in ApplyChanges, preserving sync/upsert-only semantics
 // and avoiding a CoreDNS-only delete when the caller has disabled route deletion.
+//
+// A wildcard name is skipped with a warning rather than failing the call: an existing wildcard
+// route must not stop every reconciliation just because CoreDNS was enabled later, and a rewrite
+// could never have answered it anyway.
 func (p *Provider) reconcileExistingCoreDNS(ctx context.Context, desired []*endpoint.Endpoint) error {
 	if p.coredns == nil {
 		return nil
@@ -533,14 +797,25 @@ func (p *Provider) reconcileExistingCoreDNS(ctx context.Context, desired []*endp
 
 	changes := &plan.Changes{}
 	for _, ep := range desired {
-		if _, ok := existing[strings.ToLower(ep.DNSName)]; ok {
-			changes.Create = append(changes.Create, ep)
+		host := strings.ToLower(ep.DNSName)
+		if _, ok := existing[host]; !ok {
+			continue
 		}
+		if strings.Contains(host, "*") {
+			p.log.Warn("not reconciling the CoreDNS answer for an existing wildcard route: "+
+				"an exact rewrite cannot match a wildcard", "hostname", ep.DNSName)
+			continue
+		}
+		changes.Create = append(changes.Create, ep)
 	}
 	if len(changes.Create) == 0 {
 		return nil
 	}
-	return p.applyCoreDNS(ctx, changes)
+	skipped, err := p.applyCoreDNS(ctx, changes)
+	if err != nil {
+		return err
+	}
+	return errors.Join(skippedErrors(skipped)...)
 }
 
 // adopt claims a pre-existing route for this owner by rewriting only its comment, leaving the

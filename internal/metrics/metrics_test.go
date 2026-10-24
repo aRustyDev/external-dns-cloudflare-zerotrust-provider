@@ -76,3 +76,44 @@ func TestMetrics_NilIsNoop(t *testing.T) {
 	m.SetDryRun(true)
 	m.DryRunSkipped(OpCreate)
 }
+
+func TestMetrics_RoutesPendingWritesEveryReason(t *testing.T) {
+	m := New()
+	m.MustRegister(prometheus.NewRegistry())
+
+	m.SetRoutesPending(map[string]int{PendingOther: 2, PendingSelf: 1})
+	for reason, want := range map[string]float64{PendingSelf: 1, PendingOther: 2, PendingUntagged: 0, PendingUnknown: 0} {
+		if got := testutil.ToFloat64(m.routesPending.WithLabelValues(reason)); got != want {
+			t.Errorf("routes_pending{%s} = %v, want %v", reason, got, want)
+		}
+	}
+
+	// A later call with no pending hosts must zero every reason, or an alert could never clear.
+	m.SetRoutesPending(nil)
+	for _, reason := range pendingReasons {
+		if got := testutil.ToFloat64(m.routesPending.WithLabelValues(reason)); got != 0 {
+			t.Errorf("routes_pending{%s} after clearing = %v, want 0", reason, got)
+		}
+	}
+}
+
+func TestMetrics_ListErrorCountsPerTunnel(t *testing.T) {
+	m := New()
+	m.MustRegister(prometheus.NewRegistry())
+
+	m.ListError("tunnel-a")
+	m.ListError("tunnel-a")
+	m.ListError("account")
+	if got := testutil.ToFloat64(m.listErrors.WithLabelValues("tunnel-a")); got != 2 {
+		t.Errorf("list_errors_total{tunnel-a} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.listErrors.WithLabelValues("account")); got != 1 {
+		t.Errorf("list_errors_total{account} = %v, want 1", got)
+	}
+}
+
+func TestMetrics_PendingAndListErrorNilIsNoop(t *testing.T) {
+	var m *Metrics
+	m.SetRoutesPending(map[string]int{PendingSelf: 1})
+	m.ListError("tunnel-a")
+}
