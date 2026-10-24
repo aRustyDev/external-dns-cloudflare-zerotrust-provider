@@ -1,13 +1,16 @@
 # Container build/push + release. Multi-arch image to GHCR with metadata-action semver
 # tagging, cosign keyless signing, SLSA provenance + SBOM attestations, a Trivy image-scan
 # gate before signing, and a source SBOM attached to the GitHub release on v* tags.
+#
+# This workflow PUBLISHES, so it runs only after a merge to main or on a version tag, never on a
+# pull request. A pull request gets a Dockerfile lint and a no-push build of the same Dockerfile
+# from the `docker` job in ci.yaml instead.
 name: release
 
 on:
   push:
     branches: [main]
     tags: ["v*.*.*"]
-  pull_request:
 
 permissions:
   contents: read
@@ -20,8 +23,9 @@ env:
 jobs:
   image:
     runs-on: ubuntu-latest
-    # The multi-arch buildx build + Trivy scan takes ~12 min; 40 leaves headroom for a cold
-    # cache without letting a wedged build burn a full 6-hour default timeout.
+    # With QEMU gone the multi-arch build is expected to take a few minutes, down from ~18. The
+    # limit stays generous until a run on main confirms that, and keeps a wedged build from
+    # burning the 6-hour default.
     timeout-minutes: 40
     outputs:
       image: ${{ steps.imagename.outputs.image }}
@@ -43,11 +47,11 @@ jobs:
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      # No QEMU: the Dockerfile cross-compiles on the builder's architecture, so no RUN executes
+      # under a foreign platform. The docker job in ci.yaml builds both platforms without it too.
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
         with:
           registry: ${{ env.REGISTRY }}
@@ -72,7 +76,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -83,9 +87,8 @@ jobs:
       # Publish gate: scan the pushed image for fixable HIGH/CRITICAL OS-package vulns
       # before we sign it. Go dependency vulns are gated separately by govulncheck in ci.yaml
       # (reachability-aware), so this focuses on the base image and avoids double-jeopardy on
-      # unreachable library CVEs. Runs only when an image was actually pushed.
+      # unreachable library CVEs.
       - name: Scan image (Trivy)
-        if: github.event_name != 'pull_request'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
@@ -96,11 +99,9 @@ jobs:
           severity: HIGH,CRITICAL
 
       - name: Install cosign
-        if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign image (keyless)
-        if: github.event_name != 'pull_request'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"

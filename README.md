@@ -295,9 +295,11 @@ go test -tags=integration -v -run TestLive ./test/integration/
 
 CI (`.github/workflows/`) gates every PR with `go build/vet/test -race`, **golangci-lint**, a
 **gofmt** check, **govulncheck** (reachability-aware Go CVEs), **CodeQL** (Go SAST), and
-**dependency review**; `govulncheck` and CodeQL also run weekly. Images build/push **multi-arch**
-(`linux/amd64,arm64`) to **GHCR** on pushes to `main` (`:latest`, `:sha-…`) and on `vX.Y.Z`
-tags (`:X.Y.Z`, `:X.Y`). Before signing, the pushed image is **Trivy-scanned** (fixable
+**dependency review**, plus a **Dockerfile lint** and a **no-push image build** (both platforms, cross-compiled, so no QEMU);
+`govulncheck` and CodeQL also run weekly. A pull request never publishes anything: the `release`
+workflow does not run on PRs. It builds/pushes **multi-arch** images (`linux/amd64,arm64`) to
+**GHCR** only after a merge to `main` (`:latest`, `:sha-…`) and on `vX.Y.Z` tags (`:X.Y.Z`,
+`:X.Y`). Before signing, the pushed image is **Trivy-scanned** (fixable
 HIGH/CRITICAL OS vulns gate the release). Images are **cosign-signed (keyless)** with **SLSA
 provenance + SBOM** attestations, and a source SBOM (`sbom.spdx.json`) is attached to each GitHub
 release. Cut a release by pushing a semver tag:
